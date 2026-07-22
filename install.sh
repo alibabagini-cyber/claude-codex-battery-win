@@ -47,7 +47,11 @@ Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object {
 \$lnk.Arguments = '\"${APP_DIR_WIN}\launch.vbs\"'
 \$lnk.Description = 'Claude/Codex usage battery tray'
 \$lnk.Save()
-Start-Process wscript.exe -ArgumentList '\"${APP_DIR_WIN}\launch.vbs\"'
+# WSL interop로 직접 띄운 자식은 WSL 세션 회수 때 1~2분 뒤 같이 죽는다
+# → 작업 스케줄러 일회성 태스크로 세션과 완전히 분리해서 기동
+\$tr = 'wscript.exe \"${APP_DIR_WIN}\launch.vbs\"'
+schtasks /Create /F /TN ClaudeCodexBatteryKick /SC ONCE /ST 00:00 /TR \$tr | Out-Null
+schtasks /Run /TN ClaudeCodexBatteryKick | Out-Null
 Write-Output 'OK'
 " | tr -d '\r'
 

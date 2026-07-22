@@ -72,6 +72,7 @@ cd claude-codex-battery-win
 | 아이콘에 `?` | WSL에서 `node collector.mjs` 직접 실행 → `claudeError` 값 확인 |
 | `http-401` | Claude Code를 한 번 실행해 토큰 갱신 |
 | 아이콘이 안 뜸 | `powershell -ExecutionPolicy Bypass -File tray.ps1 -Once` (디버그 모드: 데이터·에러 출력) |
+| 아이콘이 떴다가 1~2분 뒤 사라짐 | WSL 터미널에서 직접 띄운 경우 — WSL interop 자식은 세션 회수 때 함께 종료됨. `schtasks /Run /TN ClaudeCodexBatteryKick` (install.sh가 등록) 또는 재로그인으로 기동 |
 | 상세창 ⚠ 표시 | API 일시 실패 → 마지막 캐시값 표시 중이라는 뜻 |
 
 ## 제거

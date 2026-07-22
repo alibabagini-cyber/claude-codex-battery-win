@@ -177,6 +177,7 @@ function Get-UsageItems {
     $script:measuredAgo = $now - [long]$d.claude.measuredAt
   }
   $script:lastAccounts = $d.accounts
+  $script:lastRecommend = $d.recommend
   $script:lastNow = $now
   if ($d.codex) {
     if ($d.codex.primary) {
@@ -196,6 +197,7 @@ $script:iconHandles = @{}
 $script:curLabels = @()
 $script:lastItems = $null
 $script:lastAccounts = $null
+$script:lastRecommend = $null
 $script:lastNow = 0
 $script:measuredAgo = 0
 $script:lastError = ''
@@ -227,11 +229,15 @@ function Show-Details {
   if ($accts.Count -gt 0) {
     $now = $script:lastNow
     [void]$lines.Add('')
+    if ($script:lastRecommend -and $accts.Count -gt 1) {
+      [void]$lines.Add(('★ 다음 추천 계정: {0} (종합여유 {1}%)' -f $script:lastRecommend.email, $script:lastRecommend.score))
+    }
     [void]$lines.Add(('── 계정별 마지막 관측 ({0}) ──' -f $accts.Count))
     foreach ($a in $accts) {
       $mark = if ($a.current) { '▶ ' } else { '   ' }
       $when = if ($a.current) { '현재 로그인' } else { (Format-Dur ($now - [long]$a.at)) + ' 전 관측' }
-      [void]$lines.Add(('{0}{1}  ({2})' -f $mark, $a.email, $when))
+      $sc = if ($null -ne $a.score) { ', 여유 ' + $a.score + '%' } else { '' }
+      [void]$lines.Add(('{0}{1}  ({2}{3})' -f $mark, $a.email, $when, $sc))
       $l = Format-AcctWin '5시간' $a.fiveHour $now;  if ($l) { [void]$lines.Add($l) }
       $l = Format-AcctWin '주간 ' $a.weekly $now;   if ($l) { [void]$lines.Add($l) }
       if ($a.fable) {
@@ -295,7 +301,7 @@ function Update-All {
       $ni.ContextMenuStrip = New-TrayMenu
       # 왼쪽 클릭 = 상세(계정별 포함). 우클릭은 ContextMenuStrip이 처리.
       $ni.add_MouseClick({ param($s, $e)
-        if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Show-Details }
+        if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { try { Show-Details } catch {} }
       })
       $ni.Visible = $true
       $script:notifyIcons[$it.Label] = $ni
@@ -339,7 +345,8 @@ if ($Once) {
 
 $script:timer = New-Object System.Windows.Forms.Timer
 $script:timer.Interval = if ($script:notifyIcons.Count -eq 0) { 15000 } else { 120000 }
-$script:timer.add_Tick({ Update-All })
+# 틱 안 예외가 메시지루프를 죽이지 않게 격리
+$script:timer.add_Tick({ try { Update-All } catch {} })
 $script:timer.Start()
 
 [System.Windows.Forms.Application]::Run()

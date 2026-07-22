@@ -159,7 +159,48 @@ if (r.data) {
   } catch {}
 }
 // 계정별 마지막 관측(현재 계정 먼저, 나머지는 최근 관측 순)
+// 유효 잔량: 리셋 시각이 지났으면 100%로 복구된 것으로 간주
+const effRemain = (w) => {
+  if (!w) return null;
+  if (w.resetsAt && w.resetsAt < now) return 100;
+  return Math.max(0, 100 - (w.pct ?? 0));
+};
 out.accounts = Object.entries(book)
-  .map(([em, v]) => ({ email: em, current: em === email, ...v }))
+  .map(([em, v]) => {
+    const a = { email: em, current: em === email, ...v };
+    // 종합 여유 = 세 창 중 최소(병목 창 기준 보수 판정)
+    const vals = [effRemain(a.fiveHour), effRemain(a.weekly), effRemain(a.fable)].filter((x) => x !== null);
+    a.score = vals.length ? Math.min(...vals) : null;
+    return a;
+  })
   .sort((a, b) => (b.current === a.current ? b.at - a.at : b.current ? 1 : -1));
-console.log(JSON.stringify(out));
+// 다음 켤 계정 추천 = 종합 여유 최대 계정
+const scored = out.accounts.filter((a) => a.score !== null).sort((a, b) => b.score - a.score);
+out.recommend = scored.length ? { email: scored[0].email, score: scored[0].score } : null;
+
+// --next: 사람용 요약 출력 (터미널에서 "다음 어떤 계정 켜지?" 즉답)
+if (process.argv.includes("--next")) {
+  const fmtDur = (s) => {
+    if (s <= 0) return "0m";
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+    if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`;
+    return h > 0 ? `${h}h ${m}m` : `${m}m`;
+  };
+  const fmtWin = (name, w) => {
+    if (!w) return null;
+    if (w.resetsAt && w.resetsAt < now) return `${name} 리셋됨→100%`;
+    const r = w.resetsAt ? `·리셋 ${fmtDur(w.resetsAt - now)} 후` : "";
+    return `${name} ${Math.round(Math.max(0, 100 - (w.pct ?? 0)))}%${r}`;
+  };
+  for (const a of scored) {
+    const mark = a.current ? "▶" : " ";
+    const when = a.current ? "현재 로그인" : `${fmtDur(now - a.at)} 전 관측`;
+    const wins = [fmtWin("5h", a.fiveHour), fmtWin("주간", a.weekly), a.fable ? fmtWin(a.fable.model || "Fable", a.fable) : null]
+      .filter(Boolean).join(" | ");
+    console.log(`${mark} ${a.email}  종합여유 ${a.score}%  (${when})`);
+    console.log(`    ${wins}`);
+  }
+  if (out.recommend) console.log(`\n★ 다음 추천: ${out.recommend.email} (종합여유 ${out.recommend.score}%)`);
+} else {
+  console.log(JSON.stringify(out));
+}

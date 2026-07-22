@@ -176,6 +176,8 @@ function Get-UsageItems {
     }
     $script:measuredAgo = $now - [long]$d.claude.measuredAt
   }
+  $script:lastAccounts = $d.accounts
+  $script:lastNow = $now
   if ($d.codex) {
     if ($d.codex.primary) {
       Add-Win 'X5' 'Codex 5시간' @{ pct = $d.codex.primary.used_percent; resetsAt = $d.codex.primary.resets_at }
@@ -193,8 +195,21 @@ $script:notifyIcons = @{}
 $script:iconHandles = @{}
 $script:curLabels = @()
 $script:lastItems = $null
+$script:lastAccounts = $null
+$script:lastNow = 0
 $script:measuredAgo = 0
 $script:lastError = ''
+
+# 계정 상세용 한 줄 포맷: 리셋 시각이 지났으면 한도 복구로 표시
+function Format-AcctWin([string]$name, $w, [long]$now) {
+  if ($null -eq $w) { return $null }
+  if ($w.resetsAt -and [long]$w.resetsAt -lt $now) {
+    return ('    {0}  리셋됨 → 100%' -f $name)
+  }
+  $remain = [Math]::Max(0, 100 - [double]$w.pct)
+  $reset = if ($w.resetsAt) { ' · 리셋 ' + (Format-Dur ([long]$w.resetsAt - $now)) + ' 후' } else { '' }
+  return ('    {0}  남음 {1}%{2}' -f $name, [int][Math]::Round($remain), $reset)
+}
 
 function Show-Details {
   if (-not $script:lastItems) {
@@ -206,6 +221,25 @@ function Show-Details {
   [void]$lines.Add('')
   $stale = if ($script:lastError) { ('  ⚠ API 오류({0}) — 캐시값' -f $script:lastError) } else { '' }
   [void]$lines.Add(('측정 ' + (Format-Dur $script:measuredAgo) + ' 전' + $stale))
+
+  # ── 계정별 마지막 관측 (멀티 계정: 전환 직전 잔량 + 리셋 시각) ──
+  $accts = @($script:lastAccounts)
+  if ($accts.Count -gt 0) {
+    $now = $script:lastNow
+    [void]$lines.Add('')
+    [void]$lines.Add(('── 계정별 마지막 관측 ({0}) ──' -f $accts.Count))
+    foreach ($a in $accts) {
+      $mark = if ($a.current) { '▶ ' } else { '   ' }
+      $when = if ($a.current) { '현재 로그인' } else { (Format-Dur ($now - [long]$a.at)) + ' 전 관측' }
+      [void]$lines.Add(('{0}{1}  ({2})' -f $mark, $a.email, $when))
+      $l = Format-AcctWin '5시간' $a.fiveHour $now;  if ($l) { [void]$lines.Add($l) }
+      $l = Format-AcctWin '주간 ' $a.weekly $now;   if ($l) { [void]$lines.Add($l) }
+      if ($a.fable) {
+        $fn = if ($a.fable.model) { [string]$a.fable.model } else { 'Fable' }
+        $l = Format-AcctWin $fn $a.fable $now; if ($l) { [void]$lines.Add($l) }
+      }
+    }
+  }
   [System.Windows.Forms.MessageBox]::Show(($lines -join "`r`n"), 'Claude & Codex Usage — 남은 한도') | Out-Null
 }
 
@@ -243,7 +277,10 @@ function Update-All {
       $it = $items[$i]
       $ni = New-Object System.Windows.Forms.NotifyIcon
       $ni.ContextMenuStrip = New-TrayMenu
-      $ni.add_DoubleClick({ Show-Details })
+      # 왼쪽 클릭 = 상세(계정별 포함). 우클릭은 ContextMenuStrip이 처리.
+      $ni.add_MouseClick({ param($s, $e)
+        if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Show-Details }
+      })
       $ni.Visible = $true
       $script:notifyIcons[$it.Label] = $ni
     }
@@ -280,6 +317,12 @@ try {
 if ($Once) {
   Write-Output ('icons=' + $script:notifyIcons.Count + ' labels=' + ($script:curLabels -join ','))
   if ($script:lastItems) { foreach ($it in $script:lastItems) { Write-Output ('item: ' + $it.Label + ' remain=' + $it.Remain + ' tip=' + $it.Tip) } }
+  foreach ($a in @($script:lastAccounts)) {
+    Write-Output ('acct: ' + $a.email + ' current=' + $a.current)
+    $l = Format-AcctWin '5시간' $a.fiveHour $script:lastNow; if ($l) { Write-Output $l }
+    $l = Format-AcctWin '주간 ' $a.weekly $script:lastNow;  if ($l) { Write-Output $l }
+    if ($a.fable) { $l = Format-AcctWin 'Fable' $a.fable $script:lastNow; if ($l) { Write-Output $l } }
+  }
   Write-Output ('errors=' + $Error.Count)
   $Error | Select-Object -First 5 | ForEach-Object { Write-Output ('ERR: ' + $_.ToString() + ' @ ' + $_.InvocationInfo.PositionMessage) }
   foreach ($ni in $script:notifyIcons.Values) { $ni.Visible = $false; $ni.Dispose() }

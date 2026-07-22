@@ -12,7 +12,27 @@ import { homedir } from "node:os";
 const HOME = homedir();
 const CACHE_DIR = join(HOME, ".claude", "usage-widget");
 const CACHE = join(CACHE_DIR, "usage-cache.json");
+const ACCOUNTS = join(CACHE_DIR, "accounts.json");
 const now = Math.floor(Date.now() / 1000);
+
+// 현재 로그인 계정 식별 (~/.claude.json oauthAccount — 로그인 시 credentials와 함께 갱신됨)
+function readAccountEmail() {
+  try {
+    const d = JSON.parse(readFileSync(join(HOME, ".claude.json"), "utf8"));
+    return d.oauthAccount?.emailAddress ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// 계정별 마지막 관측 스냅샷 장부 — 퍼센트·리셋시각·측정시각만 (토큰 저장 없음)
+function loadAccountBook() {
+  try {
+    return JSON.parse(readFileSync(ACCOUNTS, "utf8"));
+  } catch {
+    return {};
+  }
+}
 
 // ── 1. Claude 한도: 공식 OAuth usage 엔드포인트 ─────────────
 function readAccessToken() {
@@ -113,15 +133,21 @@ function getCodex() {
 }
 
 // ── main ───────────────────────────────────────────────────
-const out = { at: now, claude: null, claudeError: null, codex: getCodex() };
+const out = { at: now, claude: null, claudeError: null, codex: getCodex(), accounts: [] };
+const email = readAccountEmail();
+const book = loadAccountBook();
 const r = await fetchClaudeUsage();
 if (r.data) {
   out.claude = normalizeClaude(r.data);
   out.claude.measuredAt = now;
-  // 성공 응답은 캐시(600) — API 실패 시 마지막 값 폴백용
+  // 성공 응답은 캐시(600) — API 실패 시 마지막 값 폴백용 + 계정별 장부 갱신
   try {
     mkdirSync(CACHE_DIR, { recursive: true });
     writeFileSync(CACHE, JSON.stringify({ at: now, raw: r.data }), { mode: 0o600 });
+    if (email) {
+      book[email] = { at: now, fiveHour: out.claude.fiveHour, weekly: out.claude.weekly, fable: out.claude.fable };
+      writeFileSync(ACCOUNTS, JSON.stringify(book), { mode: 0o600 });
+    }
   } catch {}
 } else {
   out.claudeError = r.error;
@@ -132,4 +158,8 @@ if (r.data) {
     out.claude.measuredAt = c.at;
   } catch {}
 }
+// 계정별 마지막 관측(현재 계정 먼저, 나머지는 최근 관측 순)
+out.accounts = Object.entries(book)
+  .map(([em, v]) => ({ email: em, current: em === email, ...v }))
+  .sort((a, b) => (b.current === a.current ? b.at - a.at : b.current ? 1 : -1));
 console.log(JSON.stringify(out));

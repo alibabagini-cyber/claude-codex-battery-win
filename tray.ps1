@@ -255,12 +255,28 @@ function New-TrayMenu {
   return $menu
 }
 
+# 새 트레이 아이콘은 기본적으로 오버플로(∧)에 숨음 → 표시줄로 승격 (Win11)
+# 아이콘 재구성 후마다 호출해야 함(레지스트리 엔트리는 아이콘 첫 표시 후 생김)
+function Promote-TrayIcons {
+  try {
+    Get-ChildItem 'HKCU:\Control Panel\NotifyIconSettings' -ErrorAction Stop | ForEach-Object {
+      $p = Get-ItemProperty $_.PSPath
+      if ($p.ExecutablePath -like '*powershell.exe*' -and $p.IsPromoted -ne 1) {
+        Set-ItemProperty $_.PSPath -Name IsPromoted -Value 1 -Type DWord
+      }
+    }
+  } catch {}
+}
+
 function Update-All {
   $items = Get-UsageItems
   if ($null -eq $items -or $items.Count -eq 0) {
     foreach ($ni in $script:notifyIcons.Values) { $ni.Text = 'CCB: 수집 실패 (WSL/네트워크 확인)' }
+    # 아이콘이 하나도 없는 상태의 실패 = 15초 후 바로 재시도 (2분 공백 방지)
+    if ($script:notifyIcons.Count -eq 0 -and $script:timer) { $script:timer.Interval = 15000 }
     return
   }
+  if ($script:timer) { $script:timer.Interval = 120000 }
   $script:lastItems = $items
   $dark = Get-DarkTaskbar
 
@@ -299,20 +315,12 @@ function Update-All {
     if ($old) { [CCB.Win32]::DestroyIcon($old) | Out-Null }
     $script:iconHandles[$it.Label] = $r.Handle
   }
+  if ($changed) { Promote-TrayIcons }
 }
 
 # ── 기동 ───────────────────────────────────────────────────
 Update-All
-
-# 새 트레이 아이콘은 기본적으로 오버플로(∧)에 숨음 → 표시줄로 자기 승격 (Win11)
-try {
-  Get-ChildItem 'HKCU:\Control Panel\NotifyIconSettings' -ErrorAction Stop | ForEach-Object {
-    $p = Get-ItemProperty $_.PSPath
-    if ($p.ExecutablePath -like '*powershell.exe*') {
-      Set-ItemProperty $_.PSPath -Name IsPromoted -Value 1 -Type DWord
-    }
-  }
-} catch {}
+Promote-TrayIcons
 
 if ($Once) {
   Write-Output ('icons=' + $script:notifyIcons.Count + ' labels=' + ($script:curLabels -join ','))
@@ -329,10 +337,10 @@ if ($Once) {
   exit
 }
 
-$timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 120000
-$timer.add_Tick({ Update-All })
-$timer.Start()
+$script:timer = New-Object System.Windows.Forms.Timer
+$script:timer.Interval = if ($script:notifyIcons.Count -eq 0) { 15000 } else { 120000 }
+$script:timer.add_Tick({ Update-All })
+$script:timer.Start()
 
 [System.Windows.Forms.Application]::Run()
 $script:mtx.ReleaseMutex()

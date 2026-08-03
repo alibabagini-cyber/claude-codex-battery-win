@@ -174,18 +174,63 @@ out.accounts = Object.entries(book)
     return a;
   })
   .sort((a, b) => (b.current === a.current ? b.at - a.at : b.current ? 1 : -1));
-// 다음 켤 계정 추천 = 종합 여유 최대 계정
+// 다음 켤 계정 추천 — 2단 우선순위:
+// ① 리셋 임박 소진(use-it-or-lose-it): 주간/최상위모델 창이 24h 내 리셋인데 잔량이 15% 이상
+//    남은 계정 — 안 쓰면 증발하므로 최우선, 리셋 빠른 순. 단 지금 쓸 수 있어야(5h 잔량>5%).
+// ② 그 외: 종합 여유 최대 계정.
+const fmtDur = (s) => {
+  if (s <= 0) return "0m";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+};
+const URGENT_SEC = 24 * 3600;
+const urgentInfo = (a) => {
+  let best = null;
+  for (const [name, w] of [["주간", a.weekly], [a.fable?.model || "Fable", a.fable]]) {
+    if (!w?.resetsAt) continue;
+    const left = w.resetsAt - now;
+    if (left <= 0 || left > URGENT_SEC) continue;
+    const rem = effRemain(w);
+    if (rem === null || rem < 15) continue;
+    if (!best || w.resetsAt < best.resetsAt) best = { name, remain: rem, resetsAt: w.resetsAt };
+  }
+  return best;
+};
 const scored = out.accounts.filter((a) => a.score !== null).sort((a, b) => b.score - a.score);
-out.recommend = scored.length ? { email: scored[0].email, score: scored[0].score } : null;
+const urgent = scored
+  .map((a) => ({ a, u: urgentInfo(a) }))
+  .filter((x) => x.u && (effRemain(x.a.fiveHour) ?? 100) > 5)
+  .sort((x, y) => x.u.resetsAt - y.u.resetsAt);
+if (urgent.length) {
+  const { a, u } = urgent[0];
+  out.recommend = {
+    email: a.email,
+    score: a.score,
+    urgent: true,
+    key: `${a.email}:${u.resetsAt}`, // 트레이 알림 dedup용 (같은 리셋 창 = 같은 키)
+    reason: `리셋임박 소진: ${u.name} ${Math.round(u.remain)}% 남음·리셋 ${fmtDur(u.resetsAt - now)} 후`,
+  };
+} else {
+  out.recommend = scored.length
+    ? { email: scored[0].email, score: scored[0].score, reason: `종합여유 ${scored[0].score}%` }
+    : null;
+}
+
+// 옵션: grok 영상 주간한도(GV) — 외부 수집기가 쓴 grok-usage.json 이 있을 때만 표시.
+// (공개 repo/친구 환경엔 파일 없어 미표시. 6시간 이상 stale이면 무시.)
+try {
+  const GROK = join(CACHE_DIR, "grok-usage.json");
+  if (existsSync(GROK)) {
+    const g = JSON.parse(readFileSync(GROK, "utf8"));
+    if (g && typeof g.remaining_pct === "number" && now - (g.at || 0) < 21600) {
+      out.grok = { pct: Math.max(0, 100 - g.remaining_pct), available: g.available, note: g.note || "" };
+    }
+  }
+} catch {}
 
 // --next: 사람용 요약 출력 (터미널에서 "다음 어떤 계정 켜지?" 즉답)
 if (process.argv.includes("--next")) {
-  const fmtDur = (s) => {
-    if (s <= 0) return "0m";
-    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
-    if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`;
-    return h > 0 ? `${h}h ${m}m` : `${m}m`;
-  };
   const fmtWin = (name, w) => {
     if (!w) return null;
     if (w.resetsAt && w.resetsAt < now) return `${name} 리셋됨→100%`;
@@ -195,12 +240,26 @@ if (process.argv.includes("--next")) {
   for (const a of scored) {
     const mark = a.current ? "▶" : " ";
     const when = a.current ? "현재 로그인" : `${fmtDur(now - a.at)} 전 관측`;
+    const u = urgentInfo(a);
+    const tag = u ? `  ⏳${u.name} ${Math.round(u.remain)}% 소멸임박(${fmtDur(u.resetsAt - now)})` : "";
     const wins = [fmtWin("5h", a.fiveHour), fmtWin("주간", a.weekly), a.fable ? fmtWin(a.fable.model || "Fable", a.fable) : null]
       .filter(Boolean).join(" | ");
-    console.log(`${mark} ${a.email}  종합여유 ${a.score}%  (${when})`);
+    console.log(`${mark} ${a.email}  종합여유 ${a.score}%  (${when})${tag}`);
     console.log(`    ${wins}`);
   }
-  if (out.recommend) console.log(`\n★ 다음 추천: ${out.recommend.email} (종합여유 ${out.recommend.score}%)`);
+  if (out.recommend) console.log(`\n★ 다음 추천: ${out.recommend.email} (${out.recommend.reason})`);
+  if (out.codex) {
+    const winName = (w) =>
+      !w?.window_minutes ? "?" : w.window_minutes <= 300 ? "5h" : w.window_minutes >= 10080 ? "주간" : `${Math.round(w.window_minutes / 60)}h`;
+    const cw = (w) => {
+      if (!w) return null;
+      const rem = Math.round(Math.max(0, 100 - (w.used_percent ?? 0)));
+      const r = w.resets_at ? `·리셋 ${fmtDur(w.resets_at - now)} 후` : "";
+      return `${winName(w)} ${rem}%${r}`;
+    };
+    const parts = [cw(out.codex.primary), cw(out.codex.secondary)].filter(Boolean).join(" | ");
+    if (parts) console.log(`Codex(${out.codex.plan || "?"}): ${parts}`);
+  }
 } else {
   console.log(JSON.stringify(out));
 }

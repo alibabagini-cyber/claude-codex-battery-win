@@ -180,12 +180,23 @@ function Get-UsageItems {
   $script:lastRecommend = $d.recommend
   $script:lastNow = $now
   if ($d.codex) {
-    if ($d.codex.primary) {
-      Add-Win 'X5' 'Codex 5시간' @{ pct = $d.codex.primary.used_percent; resetsAt = $d.codex.primary.resets_at }
+    # 창 길이(window_minutes)로 5시간/주간 판별 — primary가 주간일 수도 있음(실측: plan=pro는 primary=10080분)
+    function Add-CodexWin($w, [string]$fallbackLabel, [string]$fallbackName) {
+      if ($null -eq $w) { return }
+      $label = $fallbackLabel; $name = $fallbackName
+      if ($w.window_minutes) {
+        if ([long]$w.window_minutes -ge 10080) { $label = 'XW'; $name = 'Codex 주간' }
+        elseif ([long]$w.window_minutes -le 300) { $label = 'X5'; $name = 'Codex 5시간' }
+      }
+      Add-Win $label $name @{ pct = $w.used_percent; resetsAt = $w.resets_at }
     }
-    if ($d.codex.secondary) {
-      Add-Win 'XW' 'Codex 주간' @{ pct = $d.codex.secondary.used_percent; resetsAt = $d.codex.secondary.resets_at }
-    }
+    Add-CodexWin $d.codex.primary 'X5' 'Codex 5시간'
+    Add-CodexWin $d.codex.secondary 'XW' 'Codex 주간'
+  }
+  # 옵션: Grok 영상 주간한도(GV) — grok-usage.json 있을 때만. grok은 정확%가 한계 근처만 노출되어
+  # 대개 여유(100%)/소진(0%) 이진에 가깝다(사용자 인지).
+  if ($d.grok) {
+    Add-Win 'GV' 'Grok 영상주간' @{ pct = $d.grok.pct; resetsAt = $null }
   }
   $script:lastError = [string]$d.claudeError
   return $items
@@ -198,6 +209,7 @@ $script:curLabels = @()
 $script:lastItems = $null
 $script:lastAccounts = $null
 $script:lastRecommend = $null
+$script:lastUrgentKey = ''
 $script:lastNow = 0
 $script:measuredAgo = 0
 $script:lastError = ''
@@ -230,7 +242,8 @@ function Show-Details {
     $now = $script:lastNow
     [void]$lines.Add('')
     if ($script:lastRecommend -and $accts.Count -gt 1) {
-      [void]$lines.Add(('★ 다음 추천 계정: {0} (종합여유 {1}%)' -f $script:lastRecommend.email, $script:lastRecommend.score))
+      $why = if ($script:lastRecommend.reason) { $script:lastRecommend.reason } else { '종합여유 ' + $script:lastRecommend.score + '%' }
+      [void]$lines.Add(('★ 다음 추천 계정: {0} ({1})' -f $script:lastRecommend.email, $why))
     }
     [void]$lines.Add(('── 계정별 마지막 관측 ({0}) ──' -f $accts.Count))
     foreach ($a in $accts) {
@@ -322,6 +335,18 @@ function Update-All {
     $script:iconHandles[$it.Label] = $r.Handle
   }
   if ($changed) { Promote-TrayIcons }
+
+  # 한도 소멸 임박 알림 — 리셋임박 소진 추천이 새로 뜨면 풍선 알림 1회 (같은 리셋 창당 1번)
+  if ($script:lastRecommend -and $script:lastRecommend.urgent -and $script:lastRecommend.key -ne $script:lastUrgentKey) {
+    $script:lastUrgentKey = [string]$script:lastRecommend.key
+    $ni = $script:notifyIcons.Values | Select-Object -First 1
+    if ($ni) {
+      $ni.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
+      $ni.BalloonTipTitle = '⏳ Claude 한도 소멸 임박'
+      $ni.BalloonTipText = ('{0}' -f $script:lastRecommend.email) + [Environment]::NewLine + $script:lastRecommend.reason + ' — 이 계정부터 소진'
+      $ni.ShowBalloonTip(15000)
+    }
+  }
 }
 
 # ── 기동 ───────────────────────────────────────────────────

@@ -178,6 +178,7 @@ function Get-UsageItems {
   }
   $script:lastAccounts = $d.accounts
   $script:lastRecommend = $d.recommend
+  $script:lastLineup = [string]$d.lineupPath
   $script:lastNow = $now
   if ($d.codex) {
     # 창 길이(window_minutes)로 5시간/주간 판별 — primary가 주간일 수도 있음(실측: plan=pro는 primary=10080분)
@@ -209,6 +210,7 @@ $script:curLabels = @()
 $script:lastItems = $null
 $script:lastAccounts = $null
 $script:lastRecommend = $null
+$script:lastLineup = ''
 $script:lastUrgentKey = ''
 $script:lastNow = 0
 $script:measuredAgo = 0
@@ -245,12 +247,15 @@ function Show-Details {
       $why = if ($script:lastRecommend.reason) { $script:lastRecommend.reason } else { '종합여유 ' + $script:lastRecommend.score + '%' }
       [void]$lines.Add(('★ 다음 추천 계정: {0} ({1})' -f $script:lastRecommend.email, $why))
     }
-    [void]$lines.Add(('── 계정별 마지막 관측 ({0}) ──' -f $accts.Count))
+    [void]$lines.Add(('── 계정 우선순위 ({0}) ──' -f $accts.Count))
     foreach ($a in $accts) {
       $mark = if ($a.current) { '▶ ' } else { '   ' }
       $when = if ($a.current) { '현재 로그인' } else { (Format-Dur ($now - [long]$a.at)) + ' 전 관측' }
-      $sc = if ($null -ne $a.score) { ', 여유 ' + $a.score + '%' } else { '' }
-      [void]$lines.Add(('{0}{1}  ({2}{3})' -f $mark, $a.email, $when, $sc))
+      $rk = if ($a.rank) { [string]$a.rank + '. ' } else { '' }
+      $tag = ''
+      if ($a.tier -eq 'skip') { $tag = ' [제외: 주간 소진, 로그인 비효율]' }
+      elseif ($a.tier -eq 'opus') { $tag = ' [Fable 소진, Opus/Sonnet용]' }
+      [void]$lines.Add(('{0}{1}{2}  ({3}){4}' -f $mark, $rk, $a.email, $when, $tag))
       $l = Format-AcctWin '5시간' $a.fiveHour $now;  if ($l) { [void]$lines.Add($l) }
       $l = Format-AcctWin '주간 ' $a.weekly $now;   if ($l) { [void]$lines.Add($l) }
       if ($a.fable) {
@@ -262,9 +267,19 @@ function Show-Details {
   [System.Windows.Forms.MessageBox]::Show(($lines -join "`r`n"), 'Claude & Codex Usage — 남은 한도') | Out-Null
 }
 
+function Open-Lineup {
+  if (-not $script:lastLineup) {
+    [System.Windows.Forms.MessageBox]::Show('라인업 데이터가 아직 없습니다. 새로고침 후 다시 시도하세요.', 'Claude & Codex Usage') | Out-Null
+    return
+  }
+  $p = '\\wsl.localhost\' + $WSL_DISTRO + ($script:lastLineup -replace '/', '\')
+  Start-Process $p
+}
+
 function New-TrayMenu {
   $menu = New-Object System.Windows.Forms.ContextMenuStrip
   $mi1 = $menu.Items.Add('상세 정보'); $mi1.add_Click({ Show-Details })
+  $miL = $menu.Items.Add('2D 라인업 🔋'); $miL.add_Click({ Open-Lineup })
   $mi2 = $menu.Items.Add('지금 새로고침'); $mi2.add_Click({ Update-All })
   [void]$menu.Items.Add('-')
   $mi3 = $menu.Items.Add('종료'); $mi3.add_Click({

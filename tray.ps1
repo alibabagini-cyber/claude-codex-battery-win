@@ -314,6 +314,98 @@ function Get-LineupWidth {
   return $n * $LU.CardW + $LU.Pad * 2
 }
 
+# ── 크루원 캐릭터 (Among Us 풍) ─────────────────────────────
+# 계정마다 고정 색(이메일 정렬 순서로 팔레트 배정 → 계정 집합이 같으면 색 불변).
+$CREW_PALETTE = @(
+  @(197, 17, 17), @(19, 46, 209), @(17, 127, 45), @(237, 84, 189), @(240, 125, 16), @(246, 246, 87),
+  @(107, 47, 187), @(56, 255, 221), @(80, 239, 57), @(113, 73, 30), @(214, 224, 240), @(63, 71, 78)
+)
+function Get-CrewColor([string]$email) {
+  $all = @(@($script:lastAccounts) | ForEach-Object { [string]$_.email } | Sort-Object)
+  $i = [Array]::IndexOf($all, $email); if ($i -lt 0) { $i = 0 }
+  $c = $CREW_PALETTE[$i % $CREW_PALETTE.Count]
+  return [System.Drawing.Color]::FromArgb($c[0], $c[1], $c[2])
+}
+function Get-Darker([System.Drawing.Color]$c, [double]$f) {
+  return [System.Drawing.Color]::FromArgb($c.A, [int]($c.R * $f), [int]($c.G * $f), [int]($c.B * $f))
+}
+# 크루원 1명: (cx, top) 기준 폭 ~64·높이 ~84. fillPct=몸 채움 비율, mode=live|ghost|dead
+function Draw-Crewmate($g, [float]$cx, [float]$top, [System.Drawing.Color]$col, [double]$fillPct, [string]$mode) {
+  $alpha = if ($mode -eq 'ghost') { 130 } else { 255 }
+  $ink = [System.Drawing.Color]::FromArgb($alpha, 40, 40, 52)
+  $pen = New-Object System.Drawing.Pen $ink, 2.5
+  $pen.LineJoin = 'Round'
+  $body = [System.Drawing.Color]::FromArgb($alpha, $col.R, $col.G, $col.B)
+  $shade = Get-Darker $body 0.72
+  $empty = [System.Drawing.Color]::FromArgb($alpha, 226, 226, 234)
+  $st = $g.Save()
+  if ($mode -eq 'dead') {
+    # 눕힌다 (머리가 왼쪽)
+    $g.TranslateTransform($cx, $top + 42); $g.RotateTransform(-90); $g.TranslateTransform(-$cx, -($top + 42))
+  }
+  $bx = $cx - 20; $by = $top; $bw = 40; $bh = 60           # 몸통 캡슐
+  # 다리 (유령·시체는 없음)
+  if ($mode -eq 'live') {
+    foreach ($lx in @(($bx + 3), ($bx + 22))) {
+      $leg = New-RoundRect $lx ($by + $bh - 12) 15 24 6
+      $g.FillPath((New-Object System.Drawing.SolidBrush $body), $leg); $g.DrawPath($pen, $leg)
+    }
+  }
+  # 배낭
+  $pack = New-RoundRect ($bx - 12) ($by + 16) 16 30 6
+  $g.FillPath((New-Object System.Drawing.SolidBrush $shade), $pack); $g.DrawPath($pen, $pack)
+  # 몸통: 빈 회색 → 잔량만큼 아래서 색 채움 → 테두리
+  $bodyPath = New-RoundRect $bx $by $bw $bh 19
+  $g.FillPath((New-Object System.Drawing.SolidBrush $empty), $bodyPath)
+  $fh = [Math]::Round($bh * [Math]::Max(0, [Math]::Min(100, $fillPct)) / 100)
+  if ($fh -gt 0) {
+    $g.SetClip($bodyPath)
+    $g.FillRectangle((New-Object System.Drawing.SolidBrush $body), [float]($bx - 1), [float]($by + $bh - $fh), [float]($bw + 2), [float]($fh + 1))
+    $g.ResetClip()
+  }
+  if ($mode -eq 'ghost') {
+    # 유령 꼬리: 몸통 아래 물결
+    $tail = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $tail.AddLine([float]$bx, [float]($by + $bh - 8), [float]$bx, [float]($by + $bh + 8))
+    $tail.AddLine([float]$bx, [float]($by + $bh + 8), [float]($bx + 10), [float]($by + $bh - 2))
+    $tail.AddLine([float]($bx + 10), [float]($by + $bh - 2), [float]($bx + 20), [float]($by + $bh + 8))
+    $tail.AddLine([float]($bx + 20), [float]($by + $bh + 8), [float]($bx + 30), [float]($by + $bh - 2))
+    $tail.AddLine([float]($bx + 30), [float]($by + $bh - 2), [float]($bx + 40), [float]($by + $bh + 8))
+    $tail.AddLine([float]($bx + 40), [float]($by + $bh + 8), [float]($bx + 40), [float]($by + $bh - 8))
+    $tail.CloseFigure()
+    $g.FillPath((New-Object System.Drawing.SolidBrush ($(if ($fh -gt 8) { $body } else { $empty }))), $tail)
+    $g.DrawPath($pen, $tail)
+  }
+  $g.DrawPath($pen, $bodyPath)
+  # 바이저
+  $vis = New-RoundRect ($bx + 12) ($by + 12) 30 17 8
+  $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb($alpha, 150, 210, 240))), $vis)
+  $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb($alpha, 235, 250, 255))), (New-RoundRect ($bx + 16) ($by + 15) 14 6 3))
+  $g.DrawPath($pen, $vis)
+  # 표정 오버레이: 고잔량=반짝, 저잔량=땀방울, dead=뼈다귀
+  $fSym = [System.Drawing.Font]::new('Segoe UI Symbol', ([float]8), [System.Drawing.FontStyle]::Bold)
+  if ($mode -eq 'dead') {
+    # 절단면(몸통 아래=눕힌 뒤 오른쪽)에서 삐져나온 뼈: 흰 막대+양끝 관절
+    $bone = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 250, 250, 250)), 4
+    $bone.StartCap = 'Round'; $bone.EndCap = 'Round'
+    $bxm = $bx + 20; $y0 = $by + $bh - 4; $y1 = $by + $bh + 16
+    $g.DrawLine($bone, [float]$bxm, [float]$y0, [float]$bxm, [float]$y1)
+    $g.DrawLine((New-Object System.Drawing.Pen $ink, 1.5), [float]($bxm - 2), [float]$y0, [float]($bxm - 2), [float]$y1)
+    $g.DrawLine((New-Object System.Drawing.Pen $ink, 1.5), [float]($bxm + 2), [float]$y0, [float]($bxm + 2), [float]$y1)
+    foreach ($o in @(-4, 4)) {
+      $g.FillEllipse([System.Drawing.Brushes]::White, [float]($bxm + $o - 4), [float]($y1 - 4), 8, 8)
+      $g.DrawEllipse((New-Object System.Drawing.Pen $ink, 1.5), [float]($bxm + $o - 4), [float]($y1 - 4), 8, 8)
+    }
+    $g.FillRectangle([System.Drawing.Brushes]::White, [float]($bxm - 2), [float]($y0 + 2), 4, [float]($y1 - $y0 - 6))
+  } elseif ($fillPct -ge 70) {
+    $g.DrawString('✦', $fSym, (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb($alpha, 255, 220, 60))), [float]($bx + 34), [float]($by - 2))
+  } elseif ($fillPct -lt 40) {
+    $drop = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb($alpha, 100, 180, 255))
+    $g.FillEllipse($drop, [float]($bx + 41), [float]($by + 8), 5, 8)
+  }
+  $g.Restore($st)
+}
+
 # 한 계정 카드를 (x0, 카드폭) 안에 그린다
 function Draw-AcctCard($g, $a, [float]$x0, [long]$now, [string]$recoEmail) {
   $cw = $LU.CardW; $cx = $x0 + $cw / 2
@@ -340,28 +432,10 @@ function Draw-AcctCard($g, $a, [float]$x0, [long]$now, [string]$recoEmail) {
   $center = New-Object System.Drawing.StringFormat; $center.Alignment = 'Center'; $center.LineAlignment = 'Center'
   $centerTop = New-Object System.Drawing.StringFormat; $centerTop.Alignment = 'Center'
 
-  # 배터리 (제외 티어는 눕힌다)
-  $bw = 58; $bh = 82; $bx = $cx - $bw / 2; $by = $LU.Top + 14
-  $st = $g.Save()
-  if ($tier -eq 'skip') {
-    $g.TranslateTransform($cx, $by + $bh / 2); $g.RotateTransform(90); $g.TranslateTransform(-$cx, -($by + $bh / 2))
-  }
-  $capBrush = New-Object System.Drawing.SolidBrush $ink
-  $g.FillRectangle($capBrush, [float]($cx - 10), [float]($by - 7), 20, 8)
-  $body = New-RoundRect $bx $by $bw $bh 12
-  $g.FillPath([System.Drawing.Brushes]::White, $body)
-  $inner = 4
-  $fh = [Math]::Round(($bh - $inner * 2) * $fillVal / 100)
-  if ($fh -gt 0) {
-    $clip = New-RoundRect ($bx + $inner) ($by + $inner) ($bw - $inner * 2) ($bh - $inner * 2) 8
-    $g.SetClip($clip)
-    $fillBrush = New-Object System.Drawing.SolidBrush $fillCol
-    $g.FillRectangle($fillBrush, [float]($bx), [float]($by + $bh - $inner - $fh), [float]$bw, [float]$fh)
-    $g.ResetClip()
-  }
-  $g.DrawPath($inkPen, $body)
-  $g.DrawString((Get-Face $fillVal $tier), $fFace, $inkBrush, (New-Object System.Drawing.RectangleF $bx, $by, $bw, $bh), $center)
-  $g.Restore($st)
+  # 크루원 캐릭터 (live=크루원 / opus=유령 / skip=시체)
+  $bw = 64; $bh = 82; $bx = $cx - $bw / 2; $by = $LU.Top + 14
+  $mode = if ($tier -eq 'skip') { 'dead' } elseif ($tier -eq 'opus') { 'ghost' } else { 'live' }
+  Draw-Crewmate $g $cx ($by + 4) (Get-CrewColor ([string]$a.email)) $fillVal $mode
   # 그림자
   $shBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(30, 67, 67, 78))
   $g.FillEllipse($shBrush, [float]($cx - 30), [float]($by + $bh + 5), 60, 9)
@@ -446,7 +520,7 @@ function Draw-Lineup($g, [int]$W, [int]$H) {
   $ink = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(59, 59, 70))
   $gray = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(138, 138, 150))
   $center = New-Object System.Drawing.StringFormat; $center.Alignment = 'Center'
-  $g.DrawString('클로드 배터리 줄세우기', ([System.Drawing.Font]::new('Malgun Gothic', ([float]12), [System.Drawing.FontStyle]::Bold)), $ink, (New-Object System.Drawing.RectangleF 0, 12, $W, 22), $center)
+  $g.DrawString('클로드 크루원 줄세우기', ([System.Drawing.Font]::new('Malgun Gothic', ([float]12), [System.Drawing.FontStyle]::Bold)), $ink, (New-Object System.Drawing.RectangleF 0, 12, $W, 22), $center)
   $stale = if ($script:lastError) { ' · ⚠ API 오류, 캐시값' } else { '' }
   $g.DrawString(('측정 ' + (Format-Dur $script:measuredAgo) + ' 전 · 잔량 10% 미만 창은 소진 취급' + $stale), ([System.Drawing.Font]::new('Malgun Gothic', ([float]7.5))), $gray, (New-Object System.Drawing.RectangleF 0, 34, $W, 14), $center)
   $accts = @($script:lastAccounts)

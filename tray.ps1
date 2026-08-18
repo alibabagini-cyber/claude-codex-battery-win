@@ -280,6 +280,8 @@ function Open-Lineup {
 # ── 캐릭터 줄세우기 팝업 (트레이 왼클릭) ────────────────────
 # collector의 accounts(티어·순위·임박)를 배터리 캐릭터로 그린다. GDI+ 직접 렌더, 브라우저 불필요.
 $script:lineupForm = $null
+$script:animTimer = $null   # 팝업 열려 있을 때만 도는 조깅 타이머 (닫히면 Stop)
+$script:animFrame = 0
 $LU = @{ CardW = 132; Pad = 18; Top = 66; Foot = 46; H = 372 }
 
 function New-RoundRect([float]$x, [float]$y, [float]$w, [float]$h, [float]$r) {
@@ -330,7 +332,7 @@ function Get-Darker([System.Drawing.Color]$c, [double]$f) {
   return [System.Drawing.Color]::FromArgb($c.A, [int]($c.R * $f), [int]($c.G * $f), [int]($c.B * $f))
 }
 # 크루원 1명: (cx, top) 기준 폭 ~64·높이 ~84. fillPct=몸 채움 비율, mode=live|ghost|dead
-function Draw-Crewmate($g, [float]$cx, [float]$top, [System.Drawing.Color]$col, [double]$fillPct, [string]$mode) {
+function Draw-Crewmate($g, [float]$cx, [float]$top, [System.Drawing.Color]$col, [double]$fillPct, [string]$mode, [int]$jog = -1) {
   $alpha = if ($mode -eq 'ghost') { 130 } else { 255 }
   $ink = [System.Drawing.Color]::FromArgb($alpha, 40, 40, 52)
   $pen = New-Object System.Drawing.Pen $ink, 2.5
@@ -343,12 +345,28 @@ function Draw-Crewmate($g, [float]$cx, [float]$top, [System.Drawing.Color]$col, 
     # 눕힌다 (머리가 왼쪽)
     $g.TranslateTransform($cx, $top + 42); $g.RotateTransform(-90); $g.TranslateTransform(-$cx, -($top + 42))
   }
-  $bx = $cx - 20; $by = $top; $bw = 40; $bh = 60           # 몸통 캡슐
+  # 조깅 사이클(4프레임): 몸 바운스 0/-3/0/-3, 다리는 앞뒤 교차
+  $bounce = 0; $legA = 0; $legB = 0
+  if ($jog -ge 0) {
+    $ph = $jog % 4
+    $bounce = @(0, -3, 0, -3)[$ph]
+    $legA = @(0, -7, 0, 7)[$ph]     # 왼다리 y 오프셋(위로 들림=음수)
+    $legB = @(0, 7, 0, -7)[$ph]
+  }
+  $bx = $cx - 20; $by = $top + $bounce; $bw = 40; $bh = 60   # 몸통 캡슐
   # 다리 (유령·시체는 없음)
   if ($mode -eq 'live') {
-    foreach ($lx in @(($bx + 3), ($bx + 22))) {
-      $leg = New-RoundRect $lx ($by + $bh - 12) 15 24 6
+    $legs = @(@{ X = ($bx + 3); D = $legA }, @{ X = ($bx + 22); D = $legB })
+    foreach ($L in $legs) {
+      $lift = [Math]::Max(0, -$L.D)      # 들린 다리는 짧게
+      $leg = New-RoundRect $L.X ($by + $bh - 12) 15 (24 - $lift) 6
       $g.FillPath((New-Object System.Drawing.SolidBrush $body), $leg); $g.DrawPath($pen, $leg)
+    }
+    # 조깅 땀 대신 스피드라인 2줄 (뒤쪽)
+    if ($jog -ge 0 -and ($jog % 2) -eq 0) {
+      $sl = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(120, 90, 90, 110)), 1.5
+      $g.DrawLine($sl, [float]($bx - 24), [float]($by + 22), [float]($bx - 16), [float]($by + 22))
+      $g.DrawLine($sl, [float]($bx - 22), [float]($by + 32), [float]($bx - 15), [float]($by + 32))
     }
   }
   # 배낭
@@ -435,7 +453,8 @@ function Draw-AcctCard($g, $a, [float]$x0, [long]$now, [string]$recoEmail) {
   # 크루원 캐릭터 (live=크루원 / opus=유령 / skip=시체)
   $bw = 64; $bh = 82; $bx = $cx - $bw / 2; $by = $LU.Top + 14
   $mode = if ($tier -eq 'skip') { 'dead' } elseif ($tier -eq 'opus') { 'ghost' } else { 'live' }
-  Draw-Crewmate $g $cx ($by + 4) (Get-CrewColor ([string]$a.email)) $fillVal $mode
+  $jog = if ($a.current -and $mode -eq 'live') { $script:animFrame } else { -1 }
+  Draw-Crewmate $g $cx ($by + 4) (Get-CrewColor ([string]$a.email)) $fillVal $mode $jog
   # 그림자
   $shBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(30, 67, 67, 78))
   $g.FillEllipse($shBrush, [float]($cx - 30), [float]($by + $bh + 5), 60, 9)
@@ -570,6 +589,18 @@ function Show-Lineup {
     $f.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($f, $true, $null)
     $f.add_Paint({ param($s, $e) try { Draw-Lineup $e.Graphics $s.ClientSize.Width $s.ClientSize.Height } catch {} })
     $f.add_Deactivate({ param($s, $e) $s.Hide() })
+    $f.add_VisibleChanged({ param($s, $e)
+      if ($s.Visible) { if ($script:animTimer) { $script:animTimer.Start() } }
+      else { if ($script:animTimer) { $script:animTimer.Stop() } }
+    })
+    $script:animTimer = New-Object System.Windows.Forms.Timer
+    $script:animTimer.Interval = 150
+    $script:animTimer.add_Tick({
+      try {
+        $script:animFrame = ($script:animFrame + 1) % 4
+        if ($script:lineupForm -and $script:lineupForm.Visible) { $script:lineupForm.Invalidate() }
+      } catch {}
+    })
     $f.add_MouseClick({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $s.Hide() } })
     $f.add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Escape') { $s.Hide() } })
     $script:lineupForm = $f

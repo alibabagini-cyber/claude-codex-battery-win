@@ -6,6 +6,7 @@
 # 자동 감지로 동작한다. -Once = 아이콘 없이 데이터·에러만 출력(디버그).
 param(
   [switch]$Once,
+  [string]$DumpLineup = '',
   [string]$Distro = '',
   [string]$NodePath = '',
   [string]$CollectorPath = ''
@@ -20,7 +21,7 @@ $env:WSL_UTF8 = '1'
 
 # 단일 인스턴스
 $script:mtx = New-Object System.Threading.Mutex($false, 'ClaudeCodexBatteryTray')
-if (-not $script:mtx.WaitOne(0, $false)) { exit }
+if (-not $Once -and -not $script:mtx.WaitOne(0, $false)) { exit }  # -Once(디버그)는 실행 중 트레이와 공존
 
 # ── 경로 자동 감지 (install.sh가 인자로 넘기면 그대로 사용) ──
 if (-not $Distro) {
@@ -276,10 +277,243 @@ function Open-Lineup {
   Start-Process $p
 }
 
+# ── 캐릭터 줄세우기 팝업 (트레이 왼클릭) ────────────────────
+# collector의 accounts(티어·순위·임박)를 배터리 캐릭터로 그린다. GDI+ 직접 렌더, 브라우저 불필요.
+$script:lineupForm = $null
+$LU = @{ CardW = 132; Pad = 18; Top = 66; Foot = 46; H = 372 }
+
+function New-RoundRect([float]$x, [float]$y, [float]$w, [float]$h, [float]$r) {
+  $p = New-Object System.Drawing.Drawing2D.GraphicsPath
+  $d = $r * 2
+  $p.AddArc($x, $y, $d, $d, 180, 90)
+  $p.AddArc($x + $w - $d, $y, $d, $d, 270, 90)
+  $p.AddArc($x + $w - $d, $y + $h - $d, $d, $d, 0, 90)
+  $p.AddArc($x, $y + $h - $d, $d, $d, 90, 90)
+  $p.CloseFigure()
+  return $p
+}
+function Get-EffRemain($w, [long]$now) {
+  if ($null -eq $w) { return $null }
+  if ($w.resetsAt -and [long]$w.resetsAt -lt $now) { return 100 }
+  return [Math]::Max(0, 100 - [double]$w.pct)
+}
+function Get-ResetShort($w, [long]$now) {
+  if ($null -eq $w -or -not $w.resetsAt) { return '' }
+  if ([long]$w.resetsAt -lt $now) { return '리셋됨' }
+  return (Format-Dur ([long]$w.resetsAt - $now))
+}
+function Get-Face([double]$v, [string]$tier) {
+  if ($tier -eq 'skip') { return 'x_x' }
+  if ($v -ge 70) { return '^‿^' }
+  if ($v -ge 40) { return '•‿•' }
+  if ($v -ge 10) { return '•_•' }
+  return 'x_x'
+}
+function Get-LineupWidth {
+  $n = [Math]::Max(1, @($script:lastAccounts).Count)
+  return $n * $LU.CardW + $LU.Pad * 2
+}
+
+# 한 계정 카드를 (x0, 카드폭) 안에 그린다
+function Draw-AcctCard($g, $a, [float]$x0, [long]$now, [string]$recoEmail) {
+  $cw = $LU.CardW; $cx = $x0 + $cw / 2
+  $tier = [string]$a.tier
+  $w5 = Get-EffRemain $a.fiveHour $now; $wk = Get-EffRemain $a.weekly $now
+  $fb = if ($null -ne $a.fableRemain) { [double]$a.fableRemain } else { $null }
+  $fName = if ($a.fable -and $a.fable.model) { [string]$a.fable.model } else { 'Fable' }
+  $fillVal = if ($tier -eq 'fable') { if ($null -ne $fb) { $fb } elseif ($null -ne $a.score) { [double]$a.score } else { 0 } } elseif ($null -ne $wk) { $wk } else { 0 }
+  $fillVal = [Math]::Max(0, [Math]::Min(100, $fillVal))
+  $fillCol = if ($tier -eq 'skip') { [System.Drawing.Color]::FromArgb(194, 194, 201) }
+             elseif ($tier -eq 'opus') { [System.Drawing.Color]::FromArgb(142, 142, 245) }
+             elseif ($fillVal -ge 50) { [System.Drawing.Color]::FromArgb(62, 207, 106) }
+             elseif ($fillVal -ge 20) { [System.Drawing.Color]::FromArgb(255, 200, 50) }
+             else { [System.Drawing.Color]::FromArgb(255, 90, 78) }
+  $ink = [System.Drawing.Color]::FromArgb(67, 67, 78)
+  $gray = [System.Drawing.Color]::FromArgb(138, 138, 150)
+  $inkBrush = New-Object System.Drawing.SolidBrush $ink
+  $grayBrush = New-Object System.Drawing.SolidBrush $gray
+  $inkPen = New-Object System.Drawing.Pen $ink, 3
+  $fBold = [System.Drawing.Font]::new('Malgun Gothic', ([float]8.5), [System.Drawing.FontStyle]::Bold)
+  $fSmall = [System.Drawing.Font]::new('Malgun Gothic', ([float]7))
+  $fTiny = [System.Drawing.Font]::new('Malgun Gothic', ([float]6.5))
+  $fFace = [System.Drawing.Font]::new('Segoe UI Symbol', ([float]11), [System.Drawing.FontStyle]::Bold)
+  $center = New-Object System.Drawing.StringFormat; $center.Alignment = 'Center'; $center.LineAlignment = 'Center'
+  $centerTop = New-Object System.Drawing.StringFormat; $centerTop.Alignment = 'Center'
+
+  # 배터리 (제외 티어는 눕힌다)
+  $bw = 58; $bh = 82; $bx = $cx - $bw / 2; $by = $LU.Top + 14
+  $st = $g.Save()
+  if ($tier -eq 'skip') {
+    $g.TranslateTransform($cx, $by + $bh / 2); $g.RotateTransform(90); $g.TranslateTransform(-$cx, -($by + $bh / 2))
+  }
+  $capBrush = New-Object System.Drawing.SolidBrush $ink
+  $g.FillRectangle($capBrush, [float]($cx - 10), [float]($by - 7), 20, 8)
+  $body = New-RoundRect $bx $by $bw $bh 12
+  $g.FillPath([System.Drawing.Brushes]::White, $body)
+  $inner = 4
+  $fh = [Math]::Round(($bh - $inner * 2) * $fillVal / 100)
+  if ($fh -gt 0) {
+    $clip = New-RoundRect ($bx + $inner) ($by + $inner) ($bw - $inner * 2) ($bh - $inner * 2) 8
+    $g.SetClip($clip)
+    $fillBrush = New-Object System.Drawing.SolidBrush $fillCol
+    $g.FillRectangle($fillBrush, [float]($bx), [float]($by + $bh - $inner - $fh), [float]$bw, [float]$fh)
+    $g.ResetClip()
+  }
+  $g.DrawPath($inkPen, $body)
+  $g.DrawString((Get-Face $fillVal $tier), $fFace, $inkBrush, (New-Object System.Drawing.RectangleF $bx, $by, $bw, $bh), $center)
+  $g.Restore($st)
+  # 그림자
+  $shBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(30, 67, 67, 78))
+  $g.FillEllipse($shBrush, [float]($cx - 30), [float]($by + $bh + 5), 60, 9)
+
+  # 왕관(추천) — 배터리 좌상단
+  if ($recoEmail -and $a.email -eq $recoEmail) {
+    $gold = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 196, 40))
+    $goldPen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(200, 140, 0)), 1.5
+    $kx = $bx - 6; $ky = $by - 18
+    $pts = @(
+      (New-Object System.Drawing.PointF ($kx), ($ky + 14)), (New-Object System.Drawing.PointF ($kx), ($ky + 3)),
+      (New-Object System.Drawing.PointF ($kx + 6), ($ky + 8)), (New-Object System.Drawing.PointF ($kx + 11), ($ky)),
+      (New-Object System.Drawing.PointF ($kx + 16), ($ky + 8)), (New-Object System.Drawing.PointF ($kx + 22), ($ky + 3)),
+      (New-Object System.Drawing.PointF ($kx + 22), ($ky + 14))
+    )
+    $g.FillPolygon($gold, $pts); $g.DrawPolygon($goldPen, $pts)
+  }
+  # 임박 말풍선 — 배터리 우상단
+  if ($a.urgent) {
+    $u = $a.urgent
+    $txt = ('⏰ {0} {1}%' -f $u.name, [int][Math]::Round([double]$u.remain)) + "`n" + (Format-Dur ([long]$u.resetsAt - $now)) + ' 뒤 증발!'
+    $sz = $g.MeasureString($txt, $fTiny)
+    $ux = $bx + $bw - 22; $uy = $by - 30
+    $bub = New-RoundRect $ux $uy ($sz.Width + 10) ($sz.Height + 6) 6
+    $g.FillPath([System.Drawing.Brushes]::White, $bub)
+    $g.DrawPath((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 156, 63)), 1.5), $bub)
+    $g.DrawString($txt, $fTiny, (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(192, 86, 0))), [float]($ux + 5), [float]($uy + 3))
+  }
+
+  # 순위 배지
+  $y = $by + $bh + 18
+  $badge = if ($tier -eq 'skip') { '제외' } elseif ($tier -eq 'opus') { ('{0}순위·Opus용' -f $a.rank) } else { ('{0}순위' -f $a.rank) }
+  $bcol = if ($tier -eq 'skip') { [System.Drawing.Color]::FromArgb(176, 176, 184) } elseif ($tier -eq 'opus') { [System.Drawing.Color]::FromArgb(142, 142, 245) } else { $ink }
+  $bsz = $g.MeasureString($badge, $fSmall)
+  $pill = New-RoundRect ($cx - $bsz.Width / 2 - 7) $y ($bsz.Width + 14) 16 8
+  $g.FillPath((New-Object System.Drawing.SolidBrush $bcol), $pill)
+  $g.DrawString($badge, $fSmall, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF ($cx - 60), $y, 120, 16), $center)
+  $y += 20
+  # 이름·노트
+  $nm = ([string]$a.email).Split('@')[0]
+  $g.DrawString($nm, $fBold, $inkBrush, (New-Object System.Drawing.RectangleF ($x0 + 2), $y, ($cw - 4), 14), $centerTop)
+  $y += 14
+  $note = if ($tier -eq 'skip') { ('주간 {0}% — 비효율' -f [int][Math]::Round($wk)) } elseif ($tier -eq 'opus') { ('{0} 소진({1}%)' -f $fName, [int][Math]::Round($fb)) } else { ('{0} {1}%' -f $fName, [int][Math]::Round($(if ($null -ne $fb) { $fb } else { 100 }))) }
+  $g.DrawString($note, $fSmall, $grayBrush, (New-Object System.Drawing.RectangleF ($x0 + 2), $y, ($cw - 4), 12), $centerTop)
+  $y += 16
+  # 미니 바 3줄: F / 주 / 5h
+  $rows = @(
+    @{ L = $fName.Substring(0, 1); V = $fb; W = $a.fable; C = [System.Drawing.Color]::FromArgb(255, 138, 179) },
+    @{ L = '주'; V = $wk; W = $a.weekly; C = [System.Drawing.Color]::FromArgb(124, 196, 255) },
+    @{ L = '5h'; V = $w5; W = $a.fiveHour; C = [System.Drawing.Color]::FromArgb(183, 224, 124) }
+  )
+  $right = New-Object System.Drawing.StringFormat; $right.Alignment = 'Far'
+  $trackBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(228, 228, 236))
+  foreach ($r in $rows) {
+    if ($null -eq $r.V) { continue }
+    $lx = $x0 + 4
+    $g.DrawString($r.L, $fTiny, $grayBrush, (New-Object System.Drawing.RectangleF $lx, $y, 14, 10), $right)
+    $tx = $lx + 17; $tw = 44
+    $g.FillPath($trackBrush, (New-RoundRect $tx ($y + 3) $tw 5 2.5))
+    $fw = [Math]::Round($tw * [double]$r.V / 100)
+    if ($fw -gt 0) { $g.FillPath((New-Object System.Drawing.SolidBrush $r.C), (New-RoundRect $tx ($y + 3) $fw 5 2.5)) }
+    $g.DrawString(('{0}%' -f [int][Math]::Round([double]$r.V)), $fTiny, $grayBrush, (New-Object System.Drawing.RectangleF ($tx + $tw + 2), $y, 30, 10), $right)
+    $g.DrawString((Get-ResetShort $r.W $now), $fTiny, (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(165, 165, 176))), (New-Object System.Drawing.RectangleF ($tx + $tw + 32), $y, 34, 10), $right)
+    $y += 11
+  }
+  $y += 3
+  $ago = if ($a.current) { '현재 로그인' } else { (Format-Dur ($now - [long]$a.at)) + ' 전 관측' }
+  $g.DrawString($ago, $fTiny, (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(165, 165, 176))), (New-Object System.Drawing.RectangleF ($x0 + 2), $y, ($cw - 4), 10), $centerTop)
+  if ($a.current) {
+    $y += 11
+    $g.DrawString('▶ 지금 켜짐', $fSmall, (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(10, 132, 255))), (New-Object System.Drawing.RectangleF ($x0 + 2), $y, ($cw - 4), 12), $centerTop)
+  }
+}
+
+function Draw-Lineup($g, [int]$W, [int]$H) {
+  $g.SmoothingMode = 'AntiAlias'
+  $g.TextRenderingHint = 'AntiAliasGridFit'
+  # 파스텔 배경
+  $bg = New-Object System.Drawing.Drawing2D.LinearGradientBrush (New-Object System.Drawing.Point 0, 0), (New-Object System.Drawing.Point 0, $H), ([System.Drawing.Color]::FromArgb(253, 243, 247)), ([System.Drawing.Color]::FromArgb(231, 246, 238))
+  $g.FillRectangle($bg, 0, 0, $W, $H)
+  $g.DrawRectangle((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(210, 210, 220)), 1), 0, 0, $W - 1, $H - 1)
+  $ink = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(59, 59, 70))
+  $gray = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(138, 138, 150))
+  $center = New-Object System.Drawing.StringFormat; $center.Alignment = 'Center'
+  $g.DrawString('클로드 배터리 줄세우기', ([System.Drawing.Font]::new('Malgun Gothic', ([float]12), [System.Drawing.FontStyle]::Bold)), $ink, (New-Object System.Drawing.RectangleF 0, 12, $W, 22), $center)
+  $stale = if ($script:lastError) { ' · ⚠ API 오류, 캐시값' } else { '' }
+  $g.DrawString(('측정 ' + (Format-Dur $script:measuredAgo) + ' 전 · 잔량 10% 미만 창은 소진 취급' + $stale), ([System.Drawing.Font]::new('Malgun Gothic', ([float]7.5))), $gray, (New-Object System.Drawing.RectangleF 0, 34, $W, 14), $center)
+  $accts = @($script:lastAccounts)
+  $now = $script:lastNow
+  $reco = if ($script:lastRecommend) { [string]$script:lastRecommend.email } else { '' }
+  if ($accts.Count -eq 0) {
+    $g.DrawString('아직 계정 관측 데이터가 없습니다.', ([System.Drawing.Font]::new('Malgun Gothic', ([float]9))), $gray, (New-Object System.Drawing.RectangleF 0, ($H / 2), $W, 20), $center)
+    return
+  }
+  # 제외 티어 앞에 점선 구분
+  $x = $LU.Pad
+  $divDrawn = $false
+  for ($i = 0; $i -lt $accts.Count; $i++) {
+    $a = $accts[$i]
+    if (-not $divDrawn -and [string]$a.tier -eq 'skip' -and $i -gt 0) {
+      $dp = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(200, 200, 212)), 1.5
+      $dp.DashStyle = 'Dash'
+      $g.DrawLine($dp, [float]$x, [float]($LU.Top), [float]$x, [float]($H - $LU.Foot - 8))
+      $g.DrawString('비효율', ([System.Drawing.Font]::new('Malgun Gothic', ([float]6.5))), $gray, [float]($x - 14), [float]($LU.Top - 14))
+      $divDrawn = $true
+    }
+    Draw-AcctCard $g $a $x $now $reco
+    $x += $LU.CardW
+  }
+  # 추천 푸터
+  if ($script:lastRecommend -and $accts.Count -gt 1) {
+    $why = if ($script:lastRecommend.reason) { [string]$script:lastRecommend.reason } else { '종합여유 ' + $script:lastRecommend.score + '%' }
+    $txt = (('다음 추천: {0} · {1}' -f $script:lastRecommend.email, $why) -replace '—', '-')  # 특수문자(★·—)는 Malgun 폴백으로 서체가 튀므로 본문에서 제외
+    $fy = $H - $LU.Foot + 6
+    $box = New-RoundRect ($LU.Pad) $fy ($W - $LU.Pad * 2) 30 8
+    $g.FillPath([System.Drawing.Brushes]::White, $box)
+    $g.DrawPath((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 209, 102)), 2), $box)
+    $cf = [System.Drawing.StringFormat]::GenericTypographic.Clone(); $cf.Alignment = 'Center'; $cf.LineAlignment = 'Center'; $cf.Trimming = 'EllipsisCharacter'; $cf.FormatFlags = 'NoWrap'
+    $g.DrawString($txt, ([System.Drawing.Font]::new('Malgun Gothic', ([float]8.5))), $ink, (New-Object System.Drawing.RectangleF ($LU.Pad + 24), $fy, ($W - $LU.Pad * 2 - 30), 30), $cf)
+    # 별은 별도 폰트(Segoe UI Symbol)로 좌측에 — 본문 서체 오염 방지
+    $g.DrawString('★', ([System.Drawing.Font]::new('Segoe UI Symbol', ([float]10))), (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(240, 170, 20))), [float]($LU.Pad + 8), [float]($fy + 6))
+  }
+}
+
+function Show-Lineup {
+  if ($script:lineupForm -and -not $script:lineupForm.IsDisposed) {
+    if ($script:lineupForm.Visible) { $script:lineupForm.Hide(); return }
+  } else {
+    $f = New-Object System.Windows.Forms.Form
+    $f.FormBorderStyle = 'None'; $f.ShowInTaskbar = $false; $f.TopMost = $true; $f.StartPosition = 'Manual'
+    $f.Text = 'Claude & Codex Usage — 줄세우기'
+    $f.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($f, $true, $null)
+    $f.add_Paint({ param($s, $e) try { Draw-Lineup $e.Graphics $s.ClientSize.Width $s.ClientSize.Height } catch {} })
+    $f.add_Deactivate({ param($s, $e) $s.Hide() })
+    $f.add_MouseClick({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $s.Hide() } })
+    $f.add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Escape') { $s.Hide() } })
+    $script:lineupForm = $f
+  }
+  $W = Get-LineupWidth; $H = $LU.H
+  $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+  $script:lineupForm.Size = New-Object System.Drawing.Size $W, $H
+  $script:lineupForm.Location = New-Object System.Drawing.Point ($wa.Right - $W - 10), ($wa.Bottom - $H - 10)
+  $script:lineupForm.Show()
+  $script:lineupForm.Activate()
+  $script:lineupForm.Invalidate()
+}
+
 function New-TrayMenu {
   $menu = New-Object System.Windows.Forms.ContextMenuStrip
-  $mi1 = $menu.Items.Add('상세 정보'); $mi1.add_Click({ Show-Details })
-  $miL = $menu.Items.Add('2D 라인업 🔋'); $miL.add_Click({ Open-Lineup })
+  $mi0 = $menu.Items.Add('줄세우기 팝업 🔋'); $mi0.add_Click({ Show-Lineup })
+  $mi1 = $menu.Items.Add('상세 정보(텍스트)'); $mi1.add_Click({ Show-Details })
+  $miL = $menu.Items.Add('2D 라인업(브라우저)'); $miL.add_Click({ Open-Lineup })
   $mi2 = $menu.Items.Add('지금 새로고침'); $mi2.add_Click({ Update-All })
   [void]$menu.Items.Add('-')
   $mi3 = $menu.Items.Add('종료'); $mi3.add_Click({
@@ -327,9 +561,9 @@ function Update-All {
       $it = $items[$i]
       $ni = New-Object System.Windows.Forms.NotifyIcon
       $ni.ContextMenuStrip = New-TrayMenu
-      # 왼쪽 클릭 = 상세(계정별 포함). 우클릭은 ContextMenuStrip이 처리.
+      # 왼쪽 클릭 = 캐릭터 줄세우기 팝업(계정 우선순위). 우클릭은 ContextMenuStrip이 처리.
       $ni.add_MouseClick({ param($s, $e)
-        if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { try { Show-Details } catch {} }
+        if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { try { Show-Lineup } catch {} }
       })
       $ni.Visible = $true
       $script:notifyIcons[$it.Label] = $ni
@@ -350,6 +584,7 @@ function Update-All {
     $script:iconHandles[$it.Label] = $r.Handle
   }
   if ($changed) { Promote-TrayIcons }
+  if ($script:lineupForm -and -not $script:lineupForm.IsDisposed -and $script:lineupForm.Visible) { $script:lineupForm.Invalidate() }
 
   # 한도 소멸 임박 알림 — 리셋임박 소진 추천이 새로 뜨면 풍선 알림 1회 (같은 리셋 창당 1번)
   if ($script:lastRecommend -and $script:lastRecommend.urgent -and $script:lastRecommend.key -ne $script:lastUrgentKey) {
@@ -369,6 +604,16 @@ Update-All
 Promote-TrayIcons
 
 if ($Once) {
+  if ($DumpLineup) {
+    try {
+      $W = Get-LineupWidth; $H = $LU.H
+      $bmp = New-Object System.Drawing.Bitmap $W, $H
+      $g = [System.Drawing.Graphics]::FromImage($bmp)
+      Draw-Lineup $g $W $H
+      $g.Dispose(); $bmp.Save($DumpLineup, [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
+      Write-Output ('lineup dumped: ' + $DumpLineup + ' ' + $W + 'x' + $H)
+    } catch { Write-Output ('lineup dump ERR: ' + $_.ToString()) }
+  }
   Write-Output ('icons=' + $script:notifyIcons.Count + ' labels=' + ($script:curLabels -join ','))
   if ($script:lastItems) { foreach ($it in $script:lastItems) { Write-Output ('item: ' + $it.Label + ' remain=' + $it.Remain + ' tip=' + $it.Tip) } }
   foreach ($a in @($script:lastAccounts)) {

@@ -250,6 +250,7 @@ const urgentInfo = (a) => {
   }
   return best;
 };
+for (const a of out.accounts) a.urgent = a.tier !== "skip" ? urgentInfo(a) : null; // 트레이 팝업용
 const urgent = out.accounts
   .filter((a) => a.tier !== "skip" && (effRemain(a.fiveHour) ?? 100) > 5)
   .map((a) => ({ a, u: urgentInfo(a) }))

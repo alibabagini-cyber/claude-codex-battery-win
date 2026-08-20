@@ -332,7 +332,7 @@ try {
         : a.tier === "opus"
           ? `${esc(fName)} 소진(${Math.round(fb ?? 0)}%)`
           : `${esc(fName)} ${Math.round(fb ?? 100)}%`;
-    return `<div class="acct ${a.tier}${a.current ? " cur" : ""}">
+    return `<div class="acct ${a.tier}${a.current ? " cur" : ""}" data-email="${esc(a.email)}" ondblclick="ccSwitch(this.dataset.email)" title="더블클릭 = 이 계정으로 전환 명령 복사">
   ${crown}${bubble}
   <div class="batwrap"><div class="bat"><div class="fill" style="height:${Math.round(Math.max(4, Math.min(100, fillVal)))}%;background:${fillCol}"></div><div class="face">${face(fillVal, a.tier)}</div></div></div>
   <div class="shadow"></div>
@@ -379,7 +379,29 @@ try {
   .divider{width:100%;max-width:900px;display:flex;align-items:center;gap:10px;color:#a5a5b0;font-size:11px;margin:26px 0 14px}
   .divider::before,.divider::after{content:"";flex:1;border-top:1.5px dashed #d4d4de}
   .reco{margin-top:24px;background:#fff;border:2px solid #ffd166;border-radius:12px;padding:8px 16px;font-size:13px;box-shadow:0 2px 6px rgba(0,0,0,.06)}
+  .acct{cursor:pointer;transition:transform .1s}
+  .acct:hover{transform:translateY(-2px)}
+  #ccToast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#43434e;color:#fff;padding:10px 18px;border-radius:8px;font-size:13px;box-shadow:0 4px 12px rgba(0,0,0,.15);opacity:0;transition:opacity .25s;z-index:99;pointer-events:none;white-space:pre-line;text-align:center}
+  #ccToast.on{opacity:1}
 </style>
+<script>
+function ccSwitch(email){
+  var cmd = 'ccswitch ' + email;
+  var toast = document.getElementById('ccToast') || (function(){var d=document.createElement('div');d.id='ccToast';document.body.appendChild(d);return d;})();
+  var msg;
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(cmd).then(function(){
+      msg = '📋 명령 복사됨: ' + cmd + '\\nWSL 터미널에 붙여넣기 (Ctrl+V + Enter)';
+      toast.textContent = msg; toast.classList.add('on');
+      setTimeout(function(){toast.classList.remove('on');}, 3500);
+    }, function(){ msg='복사 실패 — 수동: '+cmd; toast.textContent=msg; toast.classList.add('on'); setTimeout(function(){toast.classList.remove('on');}, 4000); });
+  } else {
+    msg = '수동 실행: ' + cmd;
+    toast.textContent = msg; toast.classList.add('on');
+    setTimeout(function(){toast.classList.remove('on');}, 4000);
+  }
+}
+</script>
 <h1>🔋 클로드 배터리 줄세우기</h1>
 <div class="sub">측정 ${esc(new Date(now * 1000).toLocaleString("ko-KR", { hour12: false }))} · 잔량 ${WORTH_MIN}% 미만 창은 소진 취급</div>
 <div class="row">${live.map(card).join("")}</div>

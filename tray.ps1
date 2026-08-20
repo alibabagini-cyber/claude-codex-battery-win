@@ -428,6 +428,9 @@ function Draw-Crewmate($g, [float]$cx, [float]$top, [System.Drawing.Color]$col, 
 function Draw-AcctCard($g, $a, [float]$x0, [long]$now, [string]$recoEmail) {
   $cw = $LU.CardW; $cx = $x0 + $cw / 2
   $tier = [string]$a.tier
+  # 히트 테스트용 카드 rect 기록 (더블클릭 → ccswitch 라우팅에 사용)
+  if ($null -eq $script:cardHits) { $script:cardHits = New-Object System.Collections.ArrayList }
+  [void]$script:cardHits.Add(@{ email = [string]$a.email; x = [int]$x0; y = [int]$LU.Top; w = [int]$cw; h = [int]($LU.H - $LU.Foot - $LU.Top) })
   $w5 = Get-EffRemain $a.fiveHour $now; $wk = Get-EffRemain $a.weekly $now
   $fb = if ($null -ne $a.fableRemain) { [double]$a.fableRemain } else { $null }
   $fName = if ($a.fable -and $a.fable.model) { [string]$a.fable.model } else { 'Fable' }
@@ -529,7 +532,23 @@ function Draw-AcctCard($g, $a, [float]$x0, [long]$now, [string]$recoEmail) {
   }
 }
 
+function Invoke-Ccswitch([string]$email) {
+  # 2D 라인업 캐릭터 더블클릭 → 해당 계정 프로필로 새 WT 창 (ccauto 경유)
+  # 대상 ccswitch = ~/bin/ccswitch (프로필 세팅 + claude 인터랙티브 기동)
+  try {
+    $wt = 'C:\Users\akkan\AppData\Local\Microsoft\WindowsApps\wt.exe'
+    if (-not (Test-Path $wt)) { $wt = 'wt.exe' }
+    # 이메일은 alnum·@·._-· 만 허용 (셸 인젝션 가드)
+    if ($email -notmatch '^[A-Za-z0-9._@+-]+$') { return }
+    $cmd = "ccswitch $email"
+    $title = "ccswitch $email"
+    Start-Process $wt -ArgumentList '-w','new','--size','80,24','--title',$title,'wsl.exe','-d','Ubuntu','--','bash','-lic',$cmd -WindowStyle Normal
+  } catch {}
+}
+
 function Draw-Lineup($g, [int]$W, [int]$H) {
+  # 이번 프레임의 카드 히트 rect 초기화
+  $script:cardHits = New-Object System.Collections.ArrayList
   $g.SmoothingMode = 'AntiAlias'
   $g.TextRenderingHint = 'AntiAliasGridFit'
   # 파스텔 배경
@@ -602,6 +621,18 @@ function Show-Lineup {
       } catch {}
     })
     $f.add_MouseClick({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $s.Hide() } })
+    $f.add_MouseDoubleClick({ param($s, $e)
+      if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+      if (-not $script:cardHits -or $script:cardHits.Count -eq 0) { return }
+      $mx = [int]$e.X; $my = [int]$e.Y
+      foreach ($h in $script:cardHits) {
+        if ($mx -ge $h.x -and $mx -lt ($h.x + $h.w) -and $my -ge $h.y -and $my -lt ($h.y + $h.h)) {
+          Invoke-Ccswitch $h.email
+          $s.Hide()
+          return
+        }
+      }
+    })
     $f.add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Escape') { $s.Hide() } })
     $script:lineupForm = $f
   }

@@ -654,6 +654,7 @@ function New-TrayMenu {
   [void]$menu.Items.Add('-')
   $mi3 = $menu.Items.Add('종료'); $mi3.add_Click({
     foreach ($ni in $script:notifyIcons.Values) { $ni.Visible = $false; $ni.Dispose() }
+    if ($script:tempIcon) { $script:tempIcon.Visible = $false; $script:tempIcon.Dispose() }
     [System.Windows.Forms.Application]::Exit()
   })
   return $menu
@@ -735,8 +736,367 @@ function Update-All {
   }
 }
 
+# ── CPU 온도 아이콘(T) — LibreHardwareMonitor 원격 웹서버(:8085)를 Windows 쪽에서 직접 읽음 ──
+# 사용량 아이콘과 별개로 20초마다 갱신. LHM이 꺼져 있으면 '?' 표시.
+$script:tempIcon = $null
+$script:tempHandle = [IntPtr]::Zero
+# 가볍게: 센서 ID를 처음 한 번만 data.json(43KB)에서 찾고, 이후엔 단일 센서 엔드포인트(~50바이트)만 읽는다.
+# JSON 파싱 대신 정규식(ConvertFrom-Json 회피).
+$script:tempSensorId = $null
+$script:web = New-Object System.Net.WebClient
+function Get-CpuTemp {
+  try {
+    if (-not $script:tempSensorId) {
+      $raw = $script:web.DownloadString('http://localhost:8085/data.json')
+      $m = [regex]::Match($raw, '"Text":"CPU Package"[^}]*?"SensorId":"(/[^"]*/temperature/\d+)"')
+      if (-not $m.Success) { return $null }
+      $script:tempSensorId = $m.Groups[1].Value
+    }
+    $s = $script:web.DownloadString('http://localhost:8085/Sensor?action=Get&id=' + $script:tempSensorId)
+    $v = [regex]::Match($s, '"value":([\d.]+)'); $mx = [regex]::Match($s, '"max":([\d.]+)')
+    if (-not $v.Success) { $script:tempSensorId = $null; return $null }  # 센서 ID 바뀜 → 다음 틱에 재탐색
+    $ic = [Globalization.CultureInfo]::InvariantCulture
+    return @{ Now = [double]::Parse($v.Groups[1].Value, $ic); Max = $(if ($mx.Success) { [double]::Parse($mx.Groups[1].Value, $ic) } else { $null }) }
+  } catch { $script:tempSensorId = $null; return $null }
+}
+# 온도 색 구간(사용자 지정 2026-10-19): <50 파랑(안전) · 50~70 초록 · 70~83 주황 · 83↑ 빨강
+function Get-TempColor([double]$c) {
+  if ($c -ge 83) { return [System.Drawing.Color]::FromArgb(255, 59, 48) }
+  if ($c -ge 70) { return [System.Drawing.Color]::FromArgb(255, 149, 0) }
+  if ($c -ge 50) { return [System.Drawing.Color]::FromArgb(48, 209, 88) }
+  return [System.Drawing.Color]::FromArgb(10, 132, 255)
+}
+# 온도계 아이콘: 왼쪽 = 온도계(수은 높이·색 = 온도), 오른쪽 = 숫자(°C)
+function New-ThermoIcon($temp, [bool]$dark) {
+  $bmp = New-Object System.Drawing.Bitmap(32, 32)
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = 'AntiAliasGridFit'
+  $ink = if ($dark) { [System.Drawing.Color]::FromArgb(235, 235, 235) } else { [System.Drawing.Color]::FromArgb(45, 45, 45) }
+  $col = if ($null -ne $temp) { Get-TempColor $temp } else { [System.Drawing.Color]::FromArgb(140, 140, 140) }
+  $pen = New-Object System.Drawing.Pen $ink, 1.6
+  $fill = New-Object System.Drawing.SolidBrush $col
+  # 관(x 3..9, y 2..21) + 구(지름 11, y 19..30)
+  $g.FillEllipse($fill, 1, 19, 11, 11)
+  $lv = if ($null -ne $temp) { [Math]::Max(0.12, [Math]::Min(1, ([double]$temp - 30) / 70)) } else { 0 }
+  $top = 21 - 17 * $lv
+  $g.FillRectangle($fill, [float]4.5, [float]$top, [float]4, [float](23 - $top))
+  $tube = New-Object System.Drawing.Drawing2D.GraphicsPath
+  # 외곽선 = 관 좌우선이 구(중심 6.5,24.5 r5.5)와 만나는 점(y≈20.26, 각 309.5°/230.5°)에서 이어 그림
+  $tube.AddLine([float]3, [float]20.26, [float]3, [float]4.5); $tube.AddArc(3, 1, 7, 7, 180, 180)
+  $tube.AddLine([float]10, [float]4.5, [float]10, [float]20.26); $tube.AddArc(1, 19, 11, 11, [float]309.5, [float]281); $tube.CloseFigure()
+  $g.DrawPath($pen, $tube)
+  # 숫자
+  $s = if ($null -ne $temp) { [string][int][Math]::Round($temp) } else { '?' }
+  $fpx = if ($s.Length -ge 3) { 11 } else { 15 }
+  $font = New-Object System.Drawing.Font('Segoe UI', [float]$fpx, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+  $sf = New-Object System.Drawing.StringFormat([System.Drawing.StringFormatFlags]::NoWrap); $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'
+  $g.DrawString($s, $font, $fill, (New-Object System.Drawing.RectangleF 10, 2, 24, 28), $sf)
+  $g.Dispose()
+  $h = $bmp.GetHicon()
+  $icon = [System.Drawing.Icon]::FromHandle($h)
+  $bmp.Dispose()
+  return @{ Icon = $icon; Handle = $h }
+}
+# 고온 지속 팝업: 최근 10분 평균 90°C 이상이면 닫을 때까지 남는 Windows 알림(1시간에 1번)
+$script:tempHist = New-Object System.Collections.ArrayList
+$script:tempAlertAt = [datetime]::MinValue
+function Show-TempToast([double]$avg, [double]$cur) {
+  $top = ''
+  try {
+    $n = [Environment]::ProcessorCount
+    $top = (Get-Counter '\Process(*)\% Processor Time' -ErrorAction SilentlyContinue).CounterSamples |
+      Where-Object { $_.InstanceName -notin '_total', 'idle' } | Sort-Object CookedValue -Descending | Select-Object -First 5 |
+      ForEach-Object { '{0} {1:N0}%' -f $_.InstanceName, ($_.CookedValue / $n) }
+    $top = 'CPU 상위: ' + ($top -join ', ')
+  } catch {}
+  [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+  [void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+  $x = New-Object Windows.Data.Xml.Dom.XmlDocument
+  $x.LoadXml('<toast scenario="reminder"><visual><binding template="ToastGeneric"><text/><text/></binding></visual><actions><action activationType="system" arguments="dismiss" content=""/></actions></toast>')
+  $tx = $x.GetElementsByTagName('text')
+  [void]$tx.Item(0).AppendChild($x.CreateTextNode(('CPU 고온 지속 {0:N0}°C' -f $avg)))
+  [void]$tx.Item(1).AppendChild($x.CreateTextNode(('최근 10분 평균 {0:N0}°C (현재 {1:N0}°C)' -f $avg, $cur) + [Environment]::NewLine + $top))
+  [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))
+}
+function Test-TempAlert([double]$cur) {
+  $t = Get-Date
+  [void]$script:tempHist.Add(@{ At = $t; V = $cur })
+  while ($script:tempHist.Count -gt 0 -and ($t - $script:tempHist[0].At).TotalMinutes -gt 10) { $script:tempHist.RemoveAt(0) }
+  if ($script:tempHist.Count -lt 2 -or ($t - $script:tempHist[0].At).TotalMinutes -lt 9.5) { return }  # 10분치 쌓이기 전엔 판정 안 함
+  $avg = ($script:tempHist | ForEach-Object { $_.V } | Measure-Object -Average).Average
+  if ($avg -ge 90 -and ($t - $script:tempAlertAt).TotalMinutes -ge 60) {
+    $script:tempAlertAt = $t
+    try { Show-TempToast $avg $cur } catch {}
+  }
+}
+function Update-Temp {
+  if (-not $script:tempIcon) { return }
+  $t = Get-CpuTemp
+  $now = $null; $tip = 'CPU 온도: LibreHardwareMonitor 응답 없음'
+  if ($t -and $null -ne $t.Now) {
+    $now = $t.Now
+    Test-TempAlert $t.Now
+    [void]$script:tempLog.Add(@{ At = (Get-Date); V = [double]$t.Now })
+    while ($script:tempLog.Count -gt 4400) { $script:tempLog.RemoveAt(0) }  # 20초×24시간
+    if ($script:graphForm -and $script:graphForm.Visible) { Update-TopProcs; Update-GraphData }
+    $tip = ('CPU 패키지 {0:N0}°C · 최고 {1:N0}°C · {2:HH:mm:ss}' -f $t.Now, $t.Max, (Get-Date))
+  }
+  $script:tempIcon.Text = $tip
+  # 표시 숫자·테마가 같으면 아이콘을 다시 그리지 않음
+  $dark = Get-DarkTaskbar
+  $key = $(if ($null -ne $now) { [string][int][Math]::Round($now) } else { '?' }) + "|$dark"
+  if ($key -eq $script:tempIconKey) { return }
+  $script:tempIconKey = $key
+  $r = New-ThermoIcon $now $dark
+  $old = $script:tempHandle
+  $script:tempIcon.Icon = $r.Icon
+  if ($old -ne [IntPtr]::Zero) { [CCB.Win32]::DestroyIcon($old) | Out-Null }
+  $script:tempHandle = $r.Handle
+}
+$script:tempIconKey = ''
+
+# ── 온도 그래프 팝업(온도 아이콘 왼클릭) ──
+# 데이터 = 트레이 20초 샘플(메모리, 최대 24h) + 그 이전 구간은 WSL 크론 기록(~/.cache/thermal/<날짜>.csv, 2분 간격)
+$script:tempLog = New-Object System.Collections.ArrayList
+$script:graphForm = $null
+$script:graphHours = 3
+$script:graphBig = $false   # 기본 = 작은 창(400×300), 버튼으로 전환
+$script:sizeBtn = $null; $script:closeBtn = $null; $script:graphFg = [IntPtr]::Zero
+Add-Type -Namespace CCB -Name Fg -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();'
+$script:graphMouseX = -1
+$script:thermalDir = $null
+$hm = [regex]::Match($PSScriptRoot, '^(\\\\wsl(\.localhost)?\$?\\[^\\]+\\home\\[^\\]+)')
+if ($hm.Success) { $script:thermalDir = $hm.Groups[1].Value + '\.cache\thermal' }
+
+function Get-TempSeries([double]$hours) {
+  $from = (Get-Date).AddHours(-$hours)
+  $mem = @($script:tempLog | Where-Object { $_.At -ge $from })
+  $memStart = if ($mem.Count) { $mem[0].At } else { Get-Date }
+  $pts = New-Object System.Collections.ArrayList
+  if ($script:thermalDir) {
+    foreach ($day in @($from.Date, (Get-Date).Date) | Select-Object -Unique) {
+      $p = Join-Path $script:thermalDir ($day.ToString('yyyy-MM-dd') + '.csv')
+      if (-not (Test-Path $p)) { continue }
+      foreach ($line in [System.IO.File]::ReadAllLines($p)) {
+        $c = $line.Split(',')
+        if ($c.Count -lt 2) { continue }
+        try { $at = $day.Add([TimeSpan]::Parse($c[0])); $v = [double]::Parse($c[1], [Globalization.CultureInfo]::InvariantCulture) } catch { continue }
+        if ($at -ge $from -and $at -lt $memStart) { [void]$pts.Add(@{ At = $at; V = $v }) }
+      }
+    }
+  }
+  foreach ($m in $mem) { [void]$pts.Add($m) }
+  return ,$pts
+}
+
+function Draw-TempGraph($g, [int]$W, [int]$H) {
+  $g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = 'ClearTypeGridFit'
+  $ink = [System.Drawing.Color]::FromArgb(40, 40, 52); $muted = [System.Drawing.Color]::FromArgb(130, 130, 142)
+  $g.Clear([System.Drawing.Color]::FromArgb(252, 252, 253))
+  $g.DrawRectangle((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(200, 200, 208))), 0, 0, $W - 1, $H - 1)
+  $fT = [System.Drawing.Font]::new('Malgun Gothic', ([float]10.5), [System.Drawing.FontStyle]::Bold)
+  $fS = [System.Drawing.Font]::new('Malgun Gothic', ([float]8))
+  $bInk = New-Object System.Drawing.SolidBrush $ink; $bMuted = New-Object System.Drawing.SolidBrush $muted
+  $pts = $script:graphPts   # 그리기마다 파일을 읽지 않도록 캐시 사용(Update-GraphData가 갱신)
+  $now = $script:graphAt; $from = $now.AddHours(-$script:graphHours)
+  $g.DrawString(('CPU 온도 · 최근 {0}시간' -f $script:graphHours), $fT, $bInk, 12, 10)
+  if ($pts.Count -gt 0) {
+    $vals = @($pts | ForEach-Object { $_.V })
+    $mx = ($vals | Measure-Object -Maximum).Maximum; $av = ($vals | Measure-Object -Average).Average
+    $mxAt = ($pts | Where-Object { $_.V -eq $mx } | Select-Object -Last 1).At
+    $sub = ('현재 {0:N0}°C  ·  최고 {1:N0}°C ({2:HH:mm})  ·  평균 {3:N0}°C' -f $pts[$pts.Count - 1].V, $mx, $mxAt, $av)
+    $g.DrawString($sub, $fS, $bMuted, 12, 32)
+  }
+  # 우상단 버튼: 크게/작게 · ✕
+  $big = $script:graphBig
+  $script:sizeBtn = @{ X = $W - 86; Y = 8; W = 46; H = 22 }; $script:closeBtn = @{ X = $W - 34; Y = 8; W = 24; H = 22 }
+  $pill = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(236, 236, 241))
+  $sfb = New-Object System.Drawing.StringFormat; $sfb.Alignment = 'Center'; $sfb.LineAlignment = 'Center'
+  foreach ($bt in @(@($script:sizeBtn, $(if ($big) { '작게' } else { '크게' })), @($script:closeBtn, '✕'))) {
+    $r0 = $bt[0]; $g.FillRectangle($pill, [float]$r0.X, [float]$r0.Y, [float]$r0.W, [float]$r0.H)
+    $g.DrawString($bt[1], $fS, $bInk, (New-Object System.Drawing.RectangleF $r0.X, $r0.Y, $r0.W, $r0.H), $sfb)
+  }
+  $g.DrawString('그래프 클릭 = 기간 전환', $fS, $bMuted, 12, [float]($H - 20))
+
+  # 플롯 영역 · y축 30~105°C 고정(색 구간이 늘 같은 높이)
+  $L = 40; $R = $W - 14; $T = 56; $B = $(if ($big) { 272 } else { 160 })
+  $y = { param($v) $B - ([Math]::Max(30, [Math]::Min(105, $v)) - 30) / 75 * ($B - $T) }
+  $x = { param($t) $L + ($t - $from).TotalSeconds / ($now - $from).TotalSeconds * ($R - $L) }
+  $bands = @(@(30, 50, 10, 132, 255), @(50, 70, 48, 209, 88), @(70, 83, 255, 149, 0), @(83, 105, 255, 59, 48))
+  foreach ($bd in $bands) {
+    $y0 = & $y $bd[1]; $y1 = & $y $bd[0]
+    $g.FillRectangle((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(26, $bd[2], $bd[3], $bd[4]))), [float]$L, [float]$y0, [float]($R - $L), [float]($y1 - $y0))
+  }
+  $grid = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(225, 225, 232)), 1
+  foreach ($v in 40, 50, 60, 70, 80, 90, 100) {
+    $yy = & $y $v
+    $g.DrawLine($grid, [float]$L, [float]$yy, [float]$R, [float]$yy)
+    $g.DrawString([string]$v, $fS, $bMuted, 8, [float]($yy - 8))
+  }
+  $alert = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(200, 255, 59, 48)), 1
+  $alert.DashStyle = 'Dash'
+  $ya = & $y 90
+  $g.DrawLine($alert, [float]$L, [float]$ya, [float]$R, [float]$ya)
+  $g.DrawString('팝업 기준 90°C(10분 평균)', $fS, $bMuted, [float]($L + 4), [float]($ya - 16))
+  foreach ($k in 0, 0.5, 1) {
+    $tt = $from.AddSeconds(($now - $from).TotalSeconds * $k); $s = $tt.ToString('HH:mm')
+    $sw = $g.MeasureString($s, $fS).Width
+    $xx = [Math]::Max($L, [Math]::Min($R - $sw, (& $x $tt) - $sw / 2))
+    $g.DrawString($s, $fS, $bMuted, [float]$xx, [float]($B + 6))
+  }
+  # 그래프 아래: 지금 CPU 많이 쓰는 프로그램 + '해결하기'(Claude 세션으로 이어짐)
+  $ly0 = $B + 34
+  $g.DrawLine($grid, 10, [float]($ly0 - 6), [float]($W - 10), [float]($ly0 - 6))
+  $g.DrawString($(if ($big) { '지금 CPU 많이 쓰는 프로그램 (전체 코어 대비)' } else { 'CPU 많이 쓰는 프로그램' }), $fT, $bInk, 12, [float]$ly0)
+  $btnW = $(if ($big) { 150 } else { 100 }); $btnH = 26; $bx = $W - $btnW - 14; $by = $ly0 - 2
+  $script:fixBtn = @{ X = $bx; Y = $by; W = $btnW; H = $btnH }
+  $bp = New-Object System.Drawing.Drawing2D.GraphicsPath
+  $bp.AddArc($bx, $by, 10, 10, 180, 90); $bp.AddArc($bx + $btnW - 10, $by, 10, 10, 270, 90)
+  $bp.AddArc($bx + $btnW - 10, $by + $btnH - 10, 10, 10, 0, 90); $bp.AddArc($bx, $by + $btnH - 10, 10, 10, 90, 90); $bp.CloseFigure()
+  $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(217, 119, 87))), $bp)
+  $sfc = New-Object System.Drawing.StringFormat([System.Drawing.StringFormatFlags]::NoWrap); $sfc.Alignment = 'Center'; $sfc.LineAlignment = 'Center'
+  $g.DrawString($(if ($big) { '해결하기 → Claude' } else { '해결하기 →' }), $fT, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF $bx, $by, $btnW, $btnH), $sfc)
+  $procs = @($script:topProcs | Select-Object -First $(if ($big) { 6 } else { 3 }))
+  if ($procs.Count -eq 0) {
+    $g.DrawString('측정 중…', $fS, $bMuted, 12, [float]($ly0 + 28))
+  } else {
+    $scale = [Math]::Max(10, ($procs | ForEach-Object { $_.P } | Measure-Object -Maximum).Maximum)
+    $barCol = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(110, 118, 140))
+    $sfn = New-Object System.Drawing.StringFormat([System.Drawing.StringFormatFlags]::NoWrap); $sfn.Trimming = 'EllipsisCharacter'
+    for ($i = 0; $i -lt $procs.Count; $i++) {
+      $ry = $ly0 + 28 + $i * 19
+      $g.DrawString($procs[$i].N, $fS, $bInk, (New-Object System.Drawing.RectangleF 14, $ry, $(if ($big) { 170 } else { 120 }), 18), $sfn)
+      $bx0 = $(if ($big) { 190 } else { 140 }); $bw = [Math]::Max(2, ($procs[$i].P / $scale) * $(if ($big) { 260 } else { 150 }))
+      $g.FillRectangle($barCol, [float]$bx0, [float]($ry + 4), [float]$bw, 10)
+      $g.DrawString(('{0:N1}%' -f $procs[$i].P), $fS, $bMuted, [float]($bx0 + 6 + $bw), [float]$ry)
+    }
+  }
+  if ($pts.Count -lt 2) {
+    $g.DrawString('기록 없음 — 수집 중', $fS, $bMuted, [float]($L + 10), [float]($T + 10)); return
+  }
+  # 선: 2px, 6분 넘는 공백은 끊음(빈값 ≠ 연결)
+  $line = New-Object System.Drawing.Pen $ink, 2
+  $line.LineJoin = 'Round'
+  $seg = New-Object System.Collections.Generic.List[System.Drawing.PointF]
+  $prev = $null
+  foreach ($p in $pts) {
+    if ($prev -and ($p.At - $prev.At).TotalMinutes -gt 6) {
+      if ($seg.Count -ge 2) { $g.DrawLines($line, $seg.ToArray()) }
+      $seg.Clear()
+    }
+    $seg.Add((New-Object System.Drawing.PointF ([float](& $x $p.At)), ([float](& $y $p.V))))
+    $prev = $p
+  }
+  if ($seg.Count -ge 2) { $g.DrawLines($line, $seg.ToArray()) }
+  # 호버: 가장 가까운 점에 세로선 + 점 + 값
+  if ($script:graphMouseX -ge $L -and $script:graphMouseX -le $R) {
+    $best = $null; $bd2 = [double]::MaxValue
+    foreach ($p in $pts) { $d = [Math]::Abs((& $x $p.At) - $script:graphMouseX); if ($d -lt $bd2) { $bd2 = $d; $best = $p } }
+    if ($best) {
+      $hx = & $x $best.At; $hy = & $y $best.V
+      $g.DrawLine((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(150, 130, 130, 142)), 1), [float]$hx, [float]$T, [float]$hx, [float]$B)
+      $c = Get-TempColor $best.V
+      $g.FillEllipse((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)), [float]($hx - 6), [float]($hy - 6), 12, 12)
+      $g.FillEllipse((New-Object System.Drawing.SolidBrush $c), [float]($hx - 4), [float]($hy - 4), 8, 8)
+      $lab = ('{0:HH:mm}  {1:N0}°C' -f $best.At, $best.V)
+      $lw = $g.MeasureString($lab, $fT).Width
+      $lx = if ($hx + 10 + $lw -gt $R) { $hx - 10 - $lw } else { $hx + 10 }
+      $ly = [Math]::Max($T, $hy - 28)
+      $g.FillRectangle((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(235, 255, 255, 255))), [float]$lx, [float]$ly, [float]$lw, 20)
+      $g.DrawString($lab, $fT, $bInk, [float]$lx, [float]$ly)
+    }
+  }
+}
+
+$script:topProcs = @()
+$script:fixBtn = $null
+$script:graphPts = New-Object System.Collections.ArrayList
+$script:graphAt = Get-Date
+function Update-GraphData {
+  $script:graphPts = Get-TempSeries $script:graphHours
+  $script:graphAt = Get-Date
+  if ($script:graphForm -and -not $script:graphForm.IsDisposed) { $script:graphForm.Invalidate() }
+}
+function Update-TopProcs {
+  try {
+    $n = [Environment]::ProcessorCount
+    $script:topProcs = @((Get-Counter '\Process(*)\% Processor Time' -ErrorAction SilentlyContinue).CounterSamples |
+      Where-Object { $_.InstanceName -notin '_total', 'idle' } |
+      Group-Object { $_.InstanceName -replace '#\d+$', '' } |
+      ForEach-Object { [pscustomobject]@{ N = $_.Name; P = ($_.Group | Measure-Object CookedValue -Sum).Sum / $n } } |
+      Sort-Object P -Descending | Select-Object -First 6)
+  } catch {}
+}
+function Invoke-ThermalFix {
+  # ~/bin/thermal-fix = 현재 온도·상위 프로그램·전원 모드를 모아 claude 인터랙티브 세션으로 넘김
+  try {
+    $wt = 'C:\Users\akkan\AppData\Local\Microsoft\WindowsApps\wt.exe'
+    if (-not (Test-Path $wt)) { $wt = 'wt.exe' }
+    Start-Process $wt -ArgumentList '-w', 'new', '--title', '온도 해결', 'wsl.exe', '-d', $WSL_DISTRO, '--', 'bash', '-lic', 'thermal-fix' -WindowStyle Normal
+  } catch {}
+}
+
+function Show-TempGraph {
+  if ($script:graphForm -and -not $script:graphForm.IsDisposed) {
+    if ($script:graphForm.Visible) { $script:graphForm.Hide(); return }
+  } else {
+    $f = New-Object System.Windows.Forms.Form
+    $f.FormBorderStyle = 'None'; $f.ShowInTaskbar = $false; $f.TopMost = $true; $f.StartPosition = 'Manual'
+    $f.Text = 'CPU 온도 그래프'
+    $f.GetType().GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($f, $true, $null)
+    $f.add_Paint({ param($s, $e) try { Draw-TempGraph $e.Graphics $s.ClientSize.Width $s.ClientSize.Height } catch {} })
+    $f.add_Deactivate({ param($s, $e) $s.Hide() })
+    $f.add_MouseMove({ param($s, $e) $script:graphMouseX = $e.X; $s.Invalidate() })
+    $f.add_MouseLeave({ param($s, $e) $script:graphMouseX = -1; $s.Invalidate() })
+    $f.add_MouseClick({ param($s, $e)
+      if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+        $hitB = { param($b) $b -and $e.X -ge $b.X -and $e.X -le ($b.X + $b.W) -and $e.Y -ge $b.Y -and $e.Y -le ($b.Y + $b.H) }
+        if (& $hitB $script:closeBtn) { $s.Hide(); return }
+        if (& $hitB $script:sizeBtn) { $script:graphBig = -not $script:graphBig; Set-GraphSize; return }
+        if (& $hitB $script:fixBtn) { Invoke-ThermalFix; $s.Hide(); return }
+        if ($e.Y -lt 40 -or $e.Y -gt $(if ($script:graphBig) { 300 } else { 190 })) { return }  # 그래프 영역만 기간 전환
+        $opts = @(1, 3, 12, 24); $i = [Array]::IndexOf($opts, $script:graphHours)
+        $script:graphHours = $opts[($i + 1) % $opts.Count]; Update-GraphData
+      }
+    })
+    $f.add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Escape') { $s.Hide() } })
+    # 다른 창을 누르면 닫힘: 창이 활성화 못 됐을 때(포그라운드 잠금)는 Deactivate가 안 오므로 전경 창 변화를 직접 감시
+    $script:graphWatch = New-Object System.Windows.Forms.Timer
+    $script:graphWatch.Interval = 700
+    $script:graphWatch.add_Tick({
+      try {
+        $fg = [CCB.Fg]::GetForegroundWindow()
+        if ($fg -ne $script:graphFg -and $fg -ne $script:graphForm.Handle) { $script:graphForm.Hide() }
+      } catch {}
+    })
+    $f.add_VisibleChanged({ param($s, $e) if ($s.Visible) { $script:graphWatch.Start() } else { $script:graphWatch.Stop() } })
+    $script:graphForm = $f
+  }
+  Update-TopProcs
+  Update-GraphData
+  Set-GraphSize
+  $script:graphForm.Show()
+  $script:graphForm.Activate()
+  $script:graphFg = [CCB.Fg]::GetForegroundWindow()
+  $script:graphForm.Invalidate()
+}
+function Set-GraphSize {
+  $W = $(if ($script:graphBig) { 620 } else { 400 }); $H = $(if ($script:graphBig) { 470 } else { 300 })
+  $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+  $script:graphForm.Size = New-Object System.Drawing.Size $W, $H
+  $script:graphForm.Location = New-Object System.Drawing.Point ($wa.Right - $W - 10), ($wa.Bottom - $H - 10)
+  $script:graphForm.Invalidate()
+}
+
 # ── 기동 ───────────────────────────────────────────────────
 Update-All
+$script:tempIcon = New-Object System.Windows.Forms.NotifyIcon
+$script:tempIcon.add_MouseClick({ param($s, $e)
+  if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { try { Show-TempGraph } catch {} }
+})
+$script:tempIcon.ContextMenuStrip = New-TrayMenu
+$script:tempIcon.Visible = $true
+Update-Temp
 Promote-TrayIcons
 
 if ($Once) {
@@ -751,6 +1111,8 @@ if ($Once) {
     } catch { Write-Output ('lineup dump ERR: ' + $_.ToString()) }
   }
   Write-Output ('icons=' + $script:notifyIcons.Count + ' labels=' + ($script:curLabels -join ','))
+  Write-Output ('temp: ' + $script:tempIcon.Text)
+  $script:tempIcon.Visible = $false; $script:tempIcon.Dispose()
   if ($script:lastItems) { foreach ($it in $script:lastItems) { Write-Output ('item: ' + $it.Label + ' remain=' + $it.Remain + ' tip=' + $it.Tip) } }
   foreach ($a in @($script:lastAccounts)) {
     Write-Output ('acct: ' + $a.email + ' current=' + $a.current)
@@ -769,6 +1131,10 @@ $script:timer.Interval = if ($script:notifyIcons.Count -eq 0) { 15000 } else { 1
 # 틱 안 예외가 메시지루프를 죽이지 않게 격리
 $script:timer.add_Tick({ try { Update-All } catch {} })
 $script:timer.Start()
+$script:tempTimer = New-Object System.Windows.Forms.Timer
+$script:tempTimer.Interval = 20000
+$script:tempTimer.add_Tick({ try { Update-Temp } catch {} })
+$script:tempTimer.Start()
 
 [System.Windows.Forms.Application]::Run()
 $script:mtx.ReleaseMutex()

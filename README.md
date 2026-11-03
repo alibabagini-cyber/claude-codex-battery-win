@@ -81,7 +81,9 @@ node collector.mjs --next
 - 취소 예약은 OAuth API로 보이지 않습니다(`/api/oauth/organizations/{org}/subscription_details` = 404). claude.ai 웹 세션의
   `GET /api/organizations/{org}/subscription_details`(`status`, `plan_ending_at`, `next_charge_at`)에서만 확인됩니다.
 - 플랜 변화(Max→Pro, 만료)는 collector가 `/api/oauth/profile`의 `organization_type`으로 계정당 6시간에 한 번 자동 관측해 장부보다 새로우면 덮어씁니다.
-- 순위: 취소함 계정은 그대로 줄에 서고, 종료 3일 전부터 남은 주간 한도를 "구독 끝나기 전에 쓰기"로 추천합니다. 종료일이 지나면 "구독 끝남" 줄로 빠집니다. Pro 계정은 Max 계정 뒤에 섭니다(Pro 100% ≈ Max의 1/20).
+- 재확인 절차(계정별): Aside에서 claude.ai 로그아웃 → /login → Google로 계속하기 → 대상 계정 선택 → `fetch('/api/organizations/{uuid}/subscription_details')` → `ccnext --sub` 기록 → **원래 계정(ajdh1945)으로 재로그인**. 로그아웃 뒤 claude.ai가 스피너에서 안 넘어가면 claude.ai 오리진의 localStorage·IndexedDB·쿠키를 비우고 다시 연다. Aside에 Google 세션이 없는 계정은 `~/scripts/claude_billing_brn/sub_check.py`(자동화 Chrome 9224)로 확인할 수 있다. Google 비밀번호 재인증이 걸린 계정은 사람이 한 번 로그인해야 한다.
+- "구독중"은 장부의 다음 결제일(nextCharge)이 지나거나 확인 후 30일이 지나면 "구독중? 재확인 필요"로 바뀐다(취소는 결제일에 효력).
+- 순위: 미확인 계정은 같은 티어 안에서 확인된 계정 뒤에 선다. 취소함 계정은 그대로 줄에 서고, 종료 3일 전부터 남은 주간 한도를 "구독 끝나기 전에 쓰기"로 추천합니다. 종료일이 지나면 "구독 끝남" 줄로 빠집니다. Pro 계정은 Max 계정 뒤에 섭니다(Pro 100% ≈ Max의 1/20).
 
 ## 요구사항
 

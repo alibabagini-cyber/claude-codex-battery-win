@@ -290,7 +290,9 @@ const resolveSub = (em, plan) => {
   const maxSeen = plan?.type === "claude_max" && plan.at > now - 7 * 86400;
   if (state === "canceled" && endsAt && endsAt < now) state = "expired";
   // 취소 예약은 자동 관측이 안 되므로 "구독중" 확인값은 30일 지나면 재확인 표시
-  const stale = state === "active" && checkedTs && now - checkedTs > 30 * 86400;
+  // 취소는 다음 결제일에 효력 → 결제일이 지났거나 30일 넘으면 재확인 표시
+  const nextTs = ymdToTs(L?.nextCharge);
+  const stale = state === "active" && checkedTs && (now - checkedTs > 30 * 86400 || (nextTs && nextTs < now));
   const label = {
     active: stale ? "구독중? 재확인 필요" : checkedTs ? `구독중 · ${mmdd(checkedTs)} 확인` : "구독중",
     other: `플랜 ${plan?.type ?? "?"}`,
@@ -315,9 +317,11 @@ out.accounts = Object.entries(book).map(([em, v]) => {
   return a;
 });
 const wkOf = (a) => effRemain(a.weekly) ?? -1;
+// 구독 미확인 계정은 같은 티어 안에서 확인된 계정 뒤로(로그인해 보니 막혀 있는 경우가 있음)
+const unk = (a) => (a.sub.state === "unknown" ? 1 : 0);
 const fableTier = out.accounts.filter((a) => a.tier === "fable")
-  .sort((x, y) => (y.fableRemain ?? wkOf(y)) - (x.fableRemain ?? wkOf(x)) || wkOf(y) - wkOf(x));
-const opusTier = out.accounts.filter((a) => a.tier === "opus").sort((x, y) => wkOf(y) - wkOf(x));
+  .sort((x, y) => unk(x) - unk(y) || (y.fableRemain ?? wkOf(y)) - (x.fableRemain ?? wkOf(x)) || wkOf(y) - wkOf(x));
+const opusTier = out.accounts.filter((a) => a.tier === "opus").sort((x, y) => unk(x) - unk(y) || wkOf(y) - wkOf(x));
 // Pro 플랜 계정은 100%여도 Max의 1/20 수준 — Max 계정을 다 쓴 뒤에만
 const proTier = out.accounts.filter((a) => a.tier === "pro").sort((x, y) => wkOf(y) - wkOf(x));
 const skipTier = out.accounts.filter((a) => a.tier === "skip").sort((x, y) => wkOf(y) - wkOf(x));

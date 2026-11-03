@@ -281,20 +281,25 @@ const resolveSub = (em, plan) => {
   const checkedTs = ymdToTs(L?.checkedAt) ?? 0;
   if (plan?.type && plan.at > checkedTs) {
     if (plan.type === "claude_pro") state = "pro";
-    else if (plan.type !== "claude_max") state = "expired";
-    else if (state === "pro" || state === "expired") state = "active"; // 다시 Max로 올라감
+    else if (/free/.test(plan.type)) state = "expired";
+    else if (plan.type === "claude_max") {
+      if (state === "pro" || state === "expired") state = "active"; // 다시 Max로 올라감
+    } else state = "other"; // team·enterprise 등 처음 보는 값은 끝남으로 단정하지 않는다
     // unknown + Max 관측 = 지금은 Max지만 "취소 예약"은 OAuth로 안 보이므로 미확인 유지
   }
   const maxSeen = plan?.type === "claude_max" && plan.at > now - 7 * 86400;
   if (state === "canceled" && endsAt && endsAt < now) state = "expired";
+  // 취소 예약은 자동 관측이 안 되므로 "구독중" 확인값은 30일 지나면 재확인 표시
+  const stale = state === "active" && checkedTs && now - checkedTs > 30 * 86400;
   const label = {
-    active: "구독중",
+    active: stale ? "구독중? 재확인 필요" : checkedTs ? `구독중 · ${mmdd(checkedTs)} 확인` : "구독중",
+    other: `플랜 ${plan?.type ?? "?"}`,
     canceled: endsAt ? `취소함 · ${mmdd(endsAt)} 종료` : "취소함",
     pro: "Pro 플랜(Max 아님)",
     expired: "구독 끝남",
     unknown: maxSeen ? "Max · 취소 여부 미확인" : "구독 미확인",
   }[state];
-  return { state, label, endsAt, checkedAt: L?.checkedAt ?? null, source: L?.source ?? (plan ? "api" : null) };
+  return { state, label, stale, endsAt, checkedAt: L?.checkedAt ?? null, source: L?.source ?? (plan ? "api" : null) };
 };
 // 티어: fable=최상위모델 가용 / opus=Fable 소진·Opus/Sonnet 전용 / skip=주간 소진, 로그인 비효율 / gone=구독 끝남
 out.accounts = Object.entries(book).map(([em, v]) => {
@@ -306,7 +311,7 @@ out.accounts = Object.entries(book).map(([em, v]) => {
   a.score = vals.length ? Math.min(...vals) : null;
   a.fableRemain = fb;
   a.tier =
-    a.sub.state === "expired" ? "gone" : wk !== null && wk < WORTH_MIN ? "skip" : a.sub.state === "pro" ? "pro" : wk !== null && wk < WORTH_MIN ? "skip" : fb === null || fb >= WORTH_MIN ? "fable" : "opus";
+    a.sub.state === "expired" ? "gone" : wk !== null && wk < WORTH_MIN ? "skip" : a.sub.state === "pro" ? "pro" : fb === null || fb >= WORTH_MIN ? "fable" : "opus";
   return a;
 });
 const wkOf = (a) => effRemain(a.weekly) ?? -1;
@@ -371,16 +376,17 @@ if (urgent.length) {
   };
 } else {
   const best = fableTier[0] || opusTier[0] || proTier[0];
+  const subWarn = (a) => (a.sub.state === "unknown" || a.sub.stale ? ` · ${a.sub.label}` : "");
   out.recommend = best
     ? {
         email: best.email,
         score: best.score,
         reason:
-          best.tier === "pro"
+          (best.tier === "pro"
             ? `Max 계정 없음 — Pro 플랜, 주간 ${Math.round(wkOf(best))}%`
             : best.tier === "fable"
             ? `1순위: ${best.fable?.model || "Fable"} ${Math.round(best.fableRemain ?? 100)}%·주간 ${Math.round(wkOf(best))}%`
-            : `Fable 가용 계정 없음 — Opus/Sonnet용, 주간 ${Math.round(wkOf(best))}%`,
+            : `Fable 가용 계정 없음 — Opus/Sonnet용, 주간 ${Math.round(wkOf(best))}%`) + subWarn(best),
       }
     : null;
 }

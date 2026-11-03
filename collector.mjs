@@ -66,6 +66,25 @@ async function fetchClaudeUsage(tokenOverride) {
   }
 }
 
+// ── 1b. 플랜 관측: OAuth profile의 organization_type(claude_max / claude_pro / 그 외=구독 끝남) ──
+// 같은 토큰·같은 호스트(api.anthropic.com)만 사용. 취소 예약(기간 말 종료)은 OAuth로 안 보여서
+// subscriptions.json 장부(claude.ai 결제 화면 확인값)로 받는다 — loadSubs 참고.
+const PLAN_TTL = 6 * 3600; // 플랜은 자주 안 바뀜 — 계정당 6시간에 1회만 조회(2분 주기 수집에 호출 추가 방지)
+async function fetchPlan(token, prev) {
+  if (prev?.at && now - prev.at < PLAN_TTL) return prev;
+  try {
+    const res = await fetch("https://api.anthropic.com/api/oauth/profile", {
+      headers: { Authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20" },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return null;
+    const p = await res.json();
+    return p?.organization?.organization_type ? { type: p.organization.organization_type, at: now } : null;
+  } catch {
+    return null;
+  }
+}
+
 // API 응답 → {fiveHour, weekly, fable} (원본 getClaudeUsage와 동일 의미)
 function normalizeClaude(d) {
   const toTs = (iso) => (iso ? Math.floor(Date.parse(iso) / 1000) : null);
@@ -157,13 +176,40 @@ async function scanProfiles(book, mainEmail) {
         } catch {}
         em = em || e.name;
         if (em === mainEmail) return; // 메인 로그인 계정은 본 루프가 이미 관측
-        const r = await fetchClaudeUsage(token);
+        const [r, plan] = await Promise.all([fetchClaudeUsage(token), fetchPlan(token, book[em]?.plan)]);
+        if (plan) book[em] = { ...(book[em] || {}), plan };
         if (!r.data) return;
         const n = normalizeClaude(r.data);
-        book[em] = { at: now, fiveHour: n.fiveHour, weekly: n.weekly, fable: n.fable };
+        book[em] = { ...book[em], at: now, fiveHour: n.fiveHour, weekly: n.weekly, fable: n.fable };
       } catch {}
     })
   );
+}
+
+// ── --sub <계정 앞부분> <active|canceled|pro|expired|unknown> [종료일 YYYY-MM-DD] : 구독 장부 기록 ──
+// 예) ccnext --sub wjcgpt canceled 2026-11-20   (claude.ai 설정 > 결제 화면의 "구독 종료일")
+{
+  const i = process.argv.indexOf("--sub");
+  if (i > 0) {
+    const [who, state, ends] = process.argv.slice(i + 1).filter((x) => !x.startsWith("--"));
+    const STATES = ["active", "canceled", "pro", "expired", "unknown"];
+    const known = Object.keys(loadAccountBook());
+    const hits = known.filter((e) => e.startsWith(who || "\0"));
+    if (hits.length !== 1 || !STATES.includes(state) || (ends && !/^\d{4}-\d{2}-\d{2}$/.test(ends))) {
+      console.error(`사용법: ccnext --sub <계정 앞부분> <${STATES.join("|")}> [종료일 YYYY-MM-DD]\n계정: ${known.join(", ")}`);
+      process.exit(2);
+    }
+    let led = {};
+    try {
+      led = JSON.parse(readFileSync(join(CACHE_DIR, "subscriptions.json"), "utf8"));
+    } catch {}
+    const today = new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 10);
+    if (state === "unknown") delete led[hits[0]];
+    else led[hits[0]] = { state, ...(ends ? { endsAt: ends } : {}), checkedAt: today, source: "수동 기록(ccnext --sub)" };
+    mkdirSync(CACHE_DIR, { recursive: true });
+    writeFileSync(join(CACHE_DIR, "subscriptions.json"), JSON.stringify(led, null, 1), { mode: 0o600 });
+    console.log(`기록: ${hits[0]} → ${state}${ends ? ` (${ends} 종료)` : ""}\n`);
+  }
 }
 
 // ── main ───────────────────────────────────────────────────
@@ -179,7 +225,11 @@ if (r.data) {
     mkdirSync(CACHE_DIR, { recursive: true });
     writeFileSync(CACHE, JSON.stringify({ at: now, raw: r.data }), { mode: 0o600 });
     if (email) {
-      book[email] = { at: now, fiveHour: out.claude.fiveHour, weekly: out.claude.weekly, fable: out.claude.fable };
+      book[email] = { ...(book[email] || {}), at: now, fiveHour: out.claude.fiveHour, weekly: out.claude.weekly, fable: out.claude.fable };
+      try {
+        const plan = await fetchPlan(readAccessToken(), book[email].plan);
+        if (plan) book[email].plan = plan;
+      } catch {}
     }
   } catch {}
 } else {
@@ -205,26 +255,73 @@ const effRemain = (w) => {
 };
 // 잔량이 이 미만인 창은 "사실상 소진" — 그거 쓰려고 로그인할 가치 없음(가치 계산·추천 제외)
 const WORTH_MIN = 10;
-// 티어: fable=최상위모델 가용 / opus=Fable 소진·Opus/Sonnet 전용 / skip=주간 소진, 로그인 비효율
+// ── 구독 상태 ──
+// 장부 subscriptions.json = claude.ai 결제 화면(subscription_details)에서 확인한 값. `ccnext --sub`로 기록.
+//   { "<email>": { "state": "active|canceled|pro|expired", "endsAt": "YYYY-MM-DD", "nextCharge": "YYYY-MM-DD",
+//                  "checkedAt": "YYYY-MM-DD", "source": "..." } }  — 장부에 없는 계정 = 미확인
+// API 관측(book[em].plan.type)이 장부보다 새로우면 플랜 변화(Max→Pro·만료)는 API가 이긴다.
+const SUBS = join(CACHE_DIR, "subscriptions.json");
+const loadSubs = () => {
+  try {
+    return JSON.parse(readFileSync(SUBS, "utf8"));
+  } catch {
+    return {};
+  }
+};
+const ymdToTs = (d) => (d ? Math.floor(Date.parse(`${d}T23:59:59+09:00`) / 1000) : null);
+const mmdd = (ts) => {
+  const d = new Date((ts + 9 * 3600) * 1000);
+  return `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
+};
+const subs = loadSubs();
+const resolveSub = (em, plan) => {
+  const L = subs[em] || null;
+  let state = L?.state || "unknown";
+  const endsAt = ymdToTs(L?.endsAt);
+  const checkedTs = ymdToTs(L?.checkedAt) ?? 0;
+  if (plan?.type && plan.at > checkedTs) {
+    if (plan.type === "claude_pro") state = "pro";
+    else if (plan.type !== "claude_max") state = "expired";
+    else if (state === "pro" || state === "expired") state = "active"; // 다시 Max로 올라감
+    // unknown + Max 관측 = 지금은 Max지만 "취소 예약"은 OAuth로 안 보이므로 미확인 유지
+  }
+  const maxSeen = plan?.type === "claude_max" && plan.at > now - 7 * 86400;
+  if (state === "canceled" && endsAt && endsAt < now) state = "expired";
+  const label = {
+    active: "구독중",
+    canceled: endsAt ? `취소함 · ${mmdd(endsAt)} 종료` : "취소함",
+    pro: "Pro 플랜(Max 아님)",
+    expired: "구독 끝남",
+    unknown: maxSeen ? "Max · 취소 여부 미확인" : "구독 미확인",
+  }[state];
+  return { state, label, endsAt, checkedAt: L?.checkedAt ?? null, source: L?.source ?? (plan ? "api" : null) };
+};
+// 티어: fable=최상위모델 가용 / opus=Fable 소진·Opus/Sonnet 전용 / skip=주간 소진, 로그인 비효율 / gone=구독 끝남
 out.accounts = Object.entries(book).map(([em, v]) => {
   const a = { email: em, current: em === email, ...v };
+  a.sub = resolveSub(em, v.plan);
   const w5 = effRemain(a.fiveHour), wk = effRemain(a.weekly), fb = effRemain(a.fable);
   // 종합 여유 = 계정 사용성(5h·주간 중 최소). Fable은 별도 축(fableRemain)으로 분리.
   const vals = [w5, wk].filter((x) => x !== null);
   a.score = vals.length ? Math.min(...vals) : null;
   a.fableRemain = fb;
-  a.tier = wk !== null && wk < WORTH_MIN ? "skip" : fb === null || fb >= WORTH_MIN ? "fable" : "opus";
+  a.tier =
+    a.sub.state === "expired" ? "gone" : wk !== null && wk < WORTH_MIN ? "skip" : a.sub.state === "pro" ? "pro" : wk !== null && wk < WORTH_MIN ? "skip" : fb === null || fb >= WORTH_MIN ? "fable" : "opus";
   return a;
 });
 const wkOf = (a) => effRemain(a.weekly) ?? -1;
 const fableTier = out.accounts.filter((a) => a.tier === "fable")
   .sort((x, y) => (y.fableRemain ?? wkOf(y)) - (x.fableRemain ?? wkOf(x)) || wkOf(y) - wkOf(x));
 const opusTier = out.accounts.filter((a) => a.tier === "opus").sort((x, y) => wkOf(y) - wkOf(x));
+// Pro 플랜 계정은 100%여도 Max의 1/20 수준 — Max 계정을 다 쓴 뒤에만
+const proTier = out.accounts.filter((a) => a.tier === "pro").sort((x, y) => wkOf(y) - wkOf(x));
 const skipTier = out.accounts.filter((a) => a.tier === "skip").sort((x, y) => wkOf(y) - wkOf(x));
-out.accounts = [...fableTier, ...opusTier, ...skipTier];
+const goneTier = out.accounts.filter((a) => a.tier === "gone");
+out.accounts = [...fableTier, ...opusTier, ...proTier, ...skipTier, ...goneTier];
+const usable = (a) => a.tier === "fable" || a.tier === "opus" || a.tier === "pro";
 {
   let rank = 1;
-  for (const a of out.accounts) if (a.tier !== "skip") a.rank = rank++;
+  for (const a of out.accounts) if (usable(a)) a.rank = rank++;
 }
 // 다음 켤 계정 추천 — 2단 우선순위:
 // ① 리셋 임박 소진(use-it-or-lose-it): 주간/최상위모델 창이 24h 내 리셋인데 잔량이 15% 이상
@@ -238,21 +335,24 @@ const fmtDur = (s) => {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 };
 const URGENT_SEC = 24 * 3600;
+const SUB_END_SEC = 3 * 24 * 3600; // 취소한 계정은 종료 3일 전부터 남은 주간 한도를 "증발 임박"으로 본다
 const urgentInfo = (a) => {
   let best = null;
-  for (const [name, w] of [["주간", a.weekly], [a.fable?.model || "Fable", a.fable]]) {
+  const wins = [["주간", a.weekly], [a.fable?.model || "Fable", a.fable]];
+  if (a.sub?.state === "canceled" && a.sub.endsAt) wins.push(["구독 종료", { ...a.weekly, resetsAt: a.sub.endsAt, horizon: SUB_END_SEC }]);
+  for (const [name, w] of wins) {
     if (!w?.resetsAt) continue;
     const left = w.resetsAt - now;
-    if (left <= 0 || left > URGENT_SEC) continue;
+    if (left <= 0 || left > (w.horizon ?? URGENT_SEC)) continue;
     const rem = effRemain(w);
     if (rem === null || rem < 15) continue;
     if (!best || w.resetsAt < best.resetsAt) best = { name, remain: rem, resetsAt: w.resetsAt };
   }
   return best;
 };
-for (const a of out.accounts) a.urgent = a.tier !== "skip" ? urgentInfo(a) : null; // 트레이 팝업용
+for (const a of out.accounts) a.urgent = usable(a) ? urgentInfo(a) : null; // 트레이 팝업용
 const urgent = out.accounts
-  .filter((a) => a.tier !== "skip" && (effRemain(a.fiveHour) ?? 100) > 5)
+  .filter((a) => usable(a) && (effRemain(a.fiveHour) ?? 100) > 5)
   .map((a) => ({ a, u: urgentInfo(a) }))
   .filter((x) => x.u)
   .sort((x, y) => x.u.resetsAt - y.u.resetsAt);
@@ -264,16 +364,21 @@ if (urgent.length) {
     score: a.score,
     urgent: true,
     key: `${a.email}:${u.resetsAt}`, // 트레이 알림 dedup용 (같은 리셋 창 = 같은 키)
-    reason: `리셋임박 소진: ${u.name} ${Math.round(u.remain)}% 남음·리셋 ${fmtDur(u.resetsAt - now)} 후${fbTag}`,
+    reason:
+      u.name === "구독 종료"
+        ? `구독 종료 임박: 주간 ${Math.round(u.remain)}% 남음·${fmtDur(u.resetsAt - now)} 후 사용 불가${fbTag}`
+        : `리셋임박 소진: ${u.name} ${Math.round(u.remain)}% 남음·리셋 ${fmtDur(u.resetsAt - now)} 후${fbTag}`,
   };
 } else {
-  const best = fableTier[0] || opusTier[0];
+  const best = fableTier[0] || opusTier[0] || proTier[0];
   out.recommend = best
     ? {
         email: best.email,
         score: best.score,
         reason:
-          best.tier === "fable"
+          best.tier === "pro"
+            ? `Max 계정 없음 — Pro 플랜, 주간 ${Math.round(wkOf(best))}%`
+            : best.tier === "fable"
             ? `1순위: ${best.fable?.model || "Fable"} ${Math.round(best.fableRemain ?? 100)}%·주간 ${Math.round(wkOf(best))}%`
             : `Fable 가용 계정 없음 — Opus/Sonnet용, 주간 ${Math.round(wkOf(best))}%`,
       }
@@ -298,7 +403,7 @@ try {
   const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const heat = (v) => (v >= 50 ? "#3ecf6a" : v >= 20 ? "#ffc832" : "#ff5a4e");
   const face = (v, tier) =>
-    tier === "skip" ? "✕﹏✕" : v >= 70 ? "◕‿◕" : v >= 40 ? "•‿•" : v >= WORTH_MIN ? "•﹏•" : "✕_✕";
+    tier === "gone" ? "－_－" : tier === "skip" ? "✕﹏✕" : v >= 70 ? "◕‿◕" : v >= 40 ? "•‿•" : v >= WORTH_MIN ? "•﹏•" : "✕_✕";
   const resetStr = (w) => {
     if (!w?.resetsAt) return "";
     if (w.resetsAt < now) return "리셋됨";
@@ -312,22 +417,32 @@ try {
   const card = (a) => {
     const w5 = effRemain(a.fiveHour), wk = effRemain(a.weekly), fb = a.fableRemain;
     const fillVal = a.tier === "fable" ? (fb ?? a.score ?? 0) : wk ?? 0;
-    const fillCol = a.tier === "skip" ? "#c2c2c9" : a.tier === "opus" ? "#8e8ef5" : heat(fillVal);
+    const fillCol = a.tier === "skip" || a.tier === "gone" ? "#c2c2c9" : a.tier === "opus" || a.tier === "pro" ? "#8e8ef5" : heat(fillVal);
     const fName = a.fable?.model || "Fable";
-    const u = a.tier !== "skip" ? urgentInfo(a) : null;
+    const u = a.urgent;
     const badge =
-      a.tier === "skip"
+      a.tier === "gone"
+        ? `<span class="badge skip">구독 끝남</span>`
+        : a.tier === "skip"
         ? `<span class="badge skip">제외</span>`
-        : a.tier === "opus"
+        : a.tier === "pro"
+          ? `<span class="badge opus">${a.rank}순위 · Pro</span>`
+          : a.tier === "opus"
           ? `<span class="badge opus">${a.rank}순위 · Opus용</span>`
           : `<span class="badge">${a.rank}순위</span>`;
     const crown = out.recommend?.email === a.email ? `<div class="crown">👑</div>` : "";
     const bubble = u
-      ? `<div class="bubble">⏰ ${esc(u.name)} ${Math.round(u.remain)}%<br>${esc(fmtDur(u.resetsAt - now))} 뒤 증발!</div>`
+      ? u.name === "구독 종료"
+        ? `<div class="bubble">⏰ 구독 끝나기 전에<br>주간 ${Math.round(u.remain)}% 쓰기 (${esc(fmtDur(u.resetsAt - now))})</div>`
+        : `<div class="bubble">⏰ ${esc(u.name)} ${Math.round(u.remain)}%<br>${esc(fmtDur(u.resetsAt - now))} 뒤 증발!</div>`
       : "";
     const here = a.current ? `<div class="here">▶ 지금 켜짐</div>` : "";
     const note =
-      a.tier === "skip"
+      a.tier === "gone"
+        ? "로그인해도 Max 한도 없음"
+        : a.tier === "pro"
+        ? `Pro 한도(Max의 1/20) · 주간 ${Math.round(wk ?? 0)}%`
+        : a.tier === "skip"
         ? `주간 ${Math.round(wk ?? 0)}% — 로그인 비효율`
         : a.tier === "opus"
           ? `${esc(fName)} 소진(${Math.round(fb ?? 0)}%)`
@@ -339,12 +454,13 @@ try {
   ${badge}
   <div class="name">${esc(a.email.split("@")[0])}</div>
   <div class="note">${note}</div>
+  <div class="sub ${a.sub.state}" title="${esc(a.sub.checkedAt ? `${a.sub.checkedAt} 확인 · ${a.sub.source || ""}` : a.sub.source === "api" ? "API 플랜 관측" : "claude.ai 결제 화면 미확인")}">${esc(a.sub.label)}</div>
   <div class="bars">${bar(fName[0], fb, a.fable, "#ff8ab3")}${bar("주", wk, a.weekly, "#7cc4ff")}${bar("5h", w5, a.fiveHour, "#b7e07c")}</div>
   <div class="ago">${a.current ? "현재 로그인" : esc(fmtDur(now - a.at)) + " 전 관측"}</div>
   ${here}
 </div>`;
   };
-  const live = [...fableTier, ...opusTier];
+  const live = [...fableTier, ...opusTier, ...proTier];
   const html = `<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>클로드 배터리 줄세우기</title>
 <style>
   body{margin:0;min-height:100vh;background:linear-gradient(180deg,#fdf3f7 0%,#eef3ff 60%,#e7f6ee 100%);font-family:"Segoe UI","Malgun Gothic",sans-serif;color:#3b3b46;display:flex;flex-direction:column;align-items:center;padding:28px 16px 48px}
@@ -361,13 +477,21 @@ try {
   .face{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:19px;font-weight:600;color:#43434e;text-shadow:0 1px 0 rgba(255,255,255,.6)}
   .shadow{width:70px;height:10px;border-radius:50%;background:rgba(67,67,78,.12);margin-top:6px}
   .crown{position:absolute;top:10px;left:24px;transform:rotate(-18deg);font-size:26px;z-index:4}
-  .bubble{position:absolute;top:-6px;right:-8px;background:#fff;border:2px solid #ff9c3f;border-radius:10px;padding:4px 7px;font-size:10px;line-height:1.35;color:#c05600;z-index:3;box-shadow:0 2px 5px rgba(0,0,0,.08)}
+  .bubble{position:absolute;top:-6px;right:-26px;white-space:nowrap;background:#fff;border:2px solid #ff9c3f;border-radius:10px;padding:4px 7px;font-size:10px;line-height:1.35;color:#c05600;z-index:3;box-shadow:0 2px 5px rgba(0,0,0,.08)}
   .here{margin-top:5px;font-size:10px;font-weight:700;color:#0a84ff}
   .badge{margin-top:9px;background:#43434e;color:#fff;font-size:11px;font-weight:700;padding:2px 10px;border-radius:99px}
   .badge.opus{background:#8e8ef5}
   .badge.skip{background:#b0b0b8}
   .name{margin-top:6px;font-size:12px;font-weight:700;max-width:145px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .note{font-size:10.5px;color:#8a8a96;margin-top:1px}
+  .sub{margin-top:4px;font-size:10px;font-weight:700;padding:1px 8px;border-radius:99px;border:1.5px solid;white-space:nowrap;max-width:140px;overflow:hidden;text-overflow:ellipsis}
+  .sub.active{color:#1f8a4c;border-color:#9fd9b6;background:#effaf3}
+  .sub.canceled{color:#c05600;border-color:#ffb877;background:#fff4e8}
+  .sub.pro{color:#5b5bd6;border-color:#bdbdf5;background:#f2f2ff}
+  .sub.expired{color:#8a8a96;border-color:#d4d4de;background:#f4f4f7}
+  .sub.unknown{color:#8a8a96;border-color:#d4d4de;border-style:dashed;background:transparent}
+  .acct.gone{filter:grayscale(1);opacity:.55}
+  .acct.gone .batwrap{transform:rotate(90deg) translateX(6px)}
   .bars{width:138px;margin-top:7px;display:flex;flex-direction:column;gap:3px}
   .bar{display:flex;align-items:center;gap:4px;font-size:9.5px;color:#6b6b76}
   .bl{width:12px;text-align:right;font-weight:700}
@@ -406,6 +530,7 @@ function ccSwitch(email){
 <div class="sub">측정 ${esc(new Date(now * 1000).toLocaleString("ko-KR", { hour12: false }))} · 잔량 ${WORTH_MIN}% 미만 창은 소진 취급</div>
 <div class="row">${live.map(card).join("")}</div>
 ${skipTier.length ? `<div class="divider">여기부터는 로그인 비효율 🙅</div><div class="row">${skipTier.map(card).join("")}</div>` : ""}
+${goneTier.length ? `<div class="divider">구독 끝남 — 줄에서 뺌</div><div class="row">${goneTier.map(card).join("")}</div>` : ""}
 ${out.recommend ? `<div class="reco">👑 다음 추천: <b>${esc(out.recommend.email)}</b> — ${esc(out.recommend.reason)}</div>` : ""}
 `;
   mkdirSync(CACHE_DIR, { recursive: true });
@@ -424,8 +549,8 @@ if (process.argv.includes("--next")) {
   const printAcct = (a) => {
     const mark = a.current ? "▶" : " ";
     const when = a.current ? "현재 로그인" : `${fmtDur(now - a.at)} 전 관측`;
-    const u = a.tier !== "skip" ? urgentInfo(a) : null;
-    const tag = u ? `  ⏳${u.name} ${Math.round(u.remain)}% 소멸임박(${fmtDur(u.resetsAt - now)})` : "";
+    const u = a.urgent;
+    const tag = `  [${a.sub.label}]` + (u ? `  ⏳${u.name} ${Math.round(u.remain)}% 소멸임박(${fmtDur(u.resetsAt - now)})` : "");
     const rk = a.rank ? `${a.rank}. ` : "";
     const wins = [fmtWin("5h", a.fiveHour), fmtWin("주간", a.weekly), a.fable ? fmtWin(a.fable.model || "Fable", a.fable) : null]
       .filter(Boolean).join(" | ");
@@ -435,7 +560,9 @@ if (process.argv.includes("--next")) {
   const groups = [
     [`Fable 가능 — 이 순서로`, fableTier],
     [`Fable 소진(<${WORTH_MIN}%) — Opus/Sonnet 전용`, opusTier],
+    [`Pro 플랜 — Max 계정을 다 쓴 뒤에`, proTier],
     [`제외 — 주간 잔량 <${WORTH_MIN}%, 로그인 비효율`, skipTier],
+    [`구독 끝남 — 줄에서 뺌`, goneTier],
   ];
   for (const [title, list] of groups) {
     if (!list.length) continue;

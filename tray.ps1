@@ -254,8 +254,11 @@ function Show-Details {
       $when = if ($a.current) { '현재 로그인' } else { (Format-Dur ($now - [long]$a.at)) + ' 전 관측' }
       $rk = if ($a.rank) { [string]$a.rank + '. ' } else { '' }
       $tag = ''
-      if ($a.tier -eq 'skip') { $tag = ' [제외: 주간 소진, 로그인 비효율]' }
+      if ($a.tier -eq 'gone') { $tag = ' [구독 끝남]' }
+      elseif ($a.tier -eq 'skip') { $tag = ' [제외: 주간 소진, 로그인 비효율]' }
+      elseif ($a.tier -eq 'pro') { $tag = ' [Pro 플랜: Max 계정을 다 쓴 뒤에]' }
       elseif ($a.tier -eq 'opus') { $tag = ' [Fable 소진, Opus/Sonnet용]' }
+      if ($a.sub -and $a.sub.label -and $a.tier -ne 'gone' -and $a.tier -ne 'pro') { $tag += (' [{0}]' -f $a.sub.label) }
       [void]$lines.Add(('{0}{1}{2}  ({3}){4}' -f $mark, $rk, $a.email, $when, $tag))
       $l = Format-AcctWin '5시간' $a.fiveHour $now;  if ($l) { [void]$lines.Add($l) }
       $l = Format-AcctWin '주간 ' $a.weekly $now;   if ($l) { [void]$lines.Add($l) }
@@ -436,8 +439,8 @@ function Draw-AcctCard($g, $a, [float]$x0, [long]$now, [string]$recoEmail) {
   $fName = if ($a.fable -and $a.fable.model) { [string]$a.fable.model } else { 'Fable' }
   $fillVal = if ($tier -eq 'fable') { if ($null -ne $fb) { $fb } elseif ($null -ne $a.score) { [double]$a.score } else { 0 } } elseif ($null -ne $wk) { $wk } else { 0 }
   $fillVal = [Math]::Max(0, [Math]::Min(100, $fillVal))
-  $fillCol = if ($tier -eq 'skip') { [System.Drawing.Color]::FromArgb(194, 194, 201) }
-             elseif ($tier -eq 'opus') { [System.Drawing.Color]::FromArgb(142, 142, 245) }
+  $fillCol = if ($tier -eq 'skip' -or $tier -eq 'gone') { [System.Drawing.Color]::FromArgb(194, 194, 201) }
+             elseif ($tier -eq 'opus' -or $tier -eq 'pro') { [System.Drawing.Color]::FromArgb(142, 142, 245) }
              elseif ($fillVal -ge 50) { [System.Drawing.Color]::FromArgb(62, 207, 106) }
              elseif ($fillVal -ge 20) { [System.Drawing.Color]::FromArgb(255, 200, 50) }
              else { [System.Drawing.Color]::FromArgb(255, 90, 78) }
@@ -455,7 +458,7 @@ function Draw-AcctCard($g, $a, [float]$x0, [long]$now, [string]$recoEmail) {
 
   # 크루원 캐릭터 (live=크루원 / opus=유령 / skip=시체)
   $bw = 64; $bh = 82; $bx = $cx - $bw / 2; $by = $LU.Top + 14
-  $mode = if ($tier -eq 'skip') { 'dead' } elseif ($tier -eq 'opus') { 'ghost' } else { 'live' }
+  $mode = if ($tier -eq 'skip' -or $tier -eq 'gone') { 'dead' } elseif ($tier -eq 'opus') { 'ghost' } else { 'live' }
   $jog = if ($a.current -and $mode -eq 'live') { $script:animFrame } else { -1 }
   Draw-Crewmate $g $cx ($by + 4) (Get-CrewColor ([string]$a.email)) $fillVal $mode $jog
   # 그림자
@@ -478,19 +481,18 @@ function Draw-AcctCard($g, $a, [float]$x0, [long]$now, [string]$recoEmail) {
   # 임박 말풍선 — 배터리 우상단
   if ($a.urgent) {
     $u = $a.urgent
-    $txt = ('⏰ {0} {1}%' -f $u.name, [int][Math]::Round([double]$u.remain)) + "`n" + (Format-Dur ([long]$u.resetsAt - $now)) + ' 뒤 증발!'
-    $sz = $g.MeasureString($txt, $fTiny)
-    $ux = $bx + $bw - 22; $uy = $by - 30
-    $bub = New-RoundRect $ux $uy ($sz.Width + 10) ($sz.Height + 6) 6
-    $g.FillPath([System.Drawing.Brushes]::White, $bub)
-    $g.DrawPath((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 156, 63)), 1.5), $bub)
-    $g.DrawString($txt, $fTiny, (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(192, 86, 0))), [float]($ux + 5), [float]($uy + 3))
+    # ⏰(이모지)는 Malgun에 없어 폴백 서체로 그려지면 폭 측정이 어긋나 글자가 겹친다 → 본문은 한글만
+    $txt = if ([string]$u.name -eq '구독 종료') { ('구독 끝나기 전 주간 {0}%' -f [int][Math]::Round([double]$u.remain)) + "`n" + (Format-Dur ([long]$u.resetsAt - $now)) + ' 안에 쓰기' }
+           else { ('{0} {1}%' -f $u.name, [int][Math]::Round([double]$u.remain)) + "`n" + (Format-Dur ([long]$u.resetsAt - $now)) + ' 뒤 증발!' }
+    # 다음 카드·구분선이 위에 덮어 그리지 않도록 Draw-Lineup 끝에서 한꺼번에 그린다
+    if ($null -eq $script:pendingBubbles) { $script:pendingBubbles = New-Object System.Collections.ArrayList }
+    [void]$script:pendingBubbles.Add(@{ txt = $txt; ux = ($bx + $bw - 22); uy = ($by - 30) })
   }
 
   # 순위 배지
   $y = $by + $bh + 18
-  $badge = if ($tier -eq 'skip') { '제외' } elseif ($tier -eq 'opus') { ('{0}순위·Opus용' -f $a.rank) } else { ('{0}순위' -f $a.rank) }
-  $bcol = if ($tier -eq 'skip') { [System.Drawing.Color]::FromArgb(176, 176, 184) } elseif ($tier -eq 'opus') { [System.Drawing.Color]::FromArgb(142, 142, 245) } else { $ink }
+  $badge = if ($tier -eq 'gone') { '구독 끝남' } elseif ($tier -eq 'skip') { '제외' } elseif ($tier -eq 'pro') { ('{0}순위·Pro' -f $a.rank) } elseif ($tier -eq 'opus') { ('{0}순위·Opus용' -f $a.rank) } else { ('{0}순위' -f $a.rank) }
+  $bcol = if ($tier -eq 'skip' -or $tier -eq 'gone') { [System.Drawing.Color]::FromArgb(176, 176, 184) } elseif ($tier -eq 'opus' -or $tier -eq 'pro') { [System.Drawing.Color]::FromArgb(142, 142, 245) } else { $ink }
   $bsz = $g.MeasureString($badge, $fSmall)
   $pill = New-RoundRect ($cx - $bsz.Width / 2 - 7) $y ($bsz.Width + 14) 16 8
   $g.FillPath((New-Object System.Drawing.SolidBrush $bcol), $pill)
@@ -500,9 +502,27 @@ function Draw-AcctCard($g, $a, [float]$x0, [long]$now, [string]$recoEmail) {
   $nm = ([string]$a.email).Split('@')[0]
   $g.DrawString($nm, $fBold, $inkBrush, (New-Object System.Drawing.RectangleF ($x0 + 2), $y, ($cw - 4), 14), $centerTop)
   $y += 14
-  $note = if ($tier -eq 'skip') { ('주간 {0}% — 비효율' -f [int][Math]::Round($wk)) } elseif ($tier -eq 'opus') { ('{0} 소진({1}%)' -f $fName, [int][Math]::Round($fb)) } else { ('{0} {1}%' -f $fName, [int][Math]::Round($(if ($null -ne $fb) { $fb } else { 100 }))) }
+  $note = if ($tier -eq 'gone') { '로그인해도 Max 없음' } elseif ($tier -eq 'pro') { ('Pro 한도 · 주간 {0}%' -f [int][Math]::Round($(if ($null -ne $wk) { $wk } else { 0 }))) } elseif ($tier -eq 'skip') { ('주간 {0}% — 비효율' -f [int][Math]::Round($wk)) } elseif ($tier -eq 'opus') { ('{0} 소진({1}%)' -f $fName, [int][Math]::Round($fb)) } else { ('{0} {1}%' -f $fName, [int][Math]::Round($(if ($null -ne $fb) { $fb } else { 100 }))) }
   $g.DrawString($note, $fSmall, $grayBrush, (New-Object System.Drawing.RectangleF ($x0 + 2), $y, ($cw - 4), 12), $centerTop)
-  $y += 16
+  $y += 14
+  # 구독 상태 알약 (구독중=초록 / 취소함·종료일=주황 / Pro=보라 / 끝남·미확인=회색)
+  if ($a.sub -and $a.sub.label) {
+    $sl = [string]$a.sub.label
+    $sc = switch ([string]$a.sub.state) {
+      'active'   { @(31, 138, 76, 239, 250, 243) }
+      'canceled' { @(192, 86, 0, 255, 244, 232) }
+      'pro'      { @(91, 91, 214, 242, 242, 255) }
+      default    { @(138, 138, 150, 244, 244, 247) }
+    }
+    $ssz = $g.MeasureString($sl, $fTiny)
+    $sw = [Math]::Min($cw - 6, $ssz.Width + 10)
+    $spill = New-RoundRect ($cx - $sw / 2) $y $sw 13 6.5
+    $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb($sc[3], $sc[4], $sc[5]))), $spill)
+    $g.DrawPath((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb($sc[0], $sc[1], $sc[2])), 1), $spill)
+    $sf = New-Object System.Drawing.StringFormat; $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'; $sf.Trimming = 'EllipsisCharacter'; $sf.FormatFlags = 'NoWrap'
+    $g.DrawString($sl, $fTiny, (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb($sc[0], $sc[1], $sc[2]))), (New-Object System.Drawing.RectangleF ($cx - $sw / 2), $y, $sw, 13), $sf)
+    $y += 16
+  } else { $y += 2 }
   # 미니 바 3줄: F / 주 / 5h
   $rows = @(
     @{ L = $fName.Substring(0, 1); V = $fb; W = $a.fable; C = [System.Drawing.Color]::FromArgb(255, 138, 179) },
@@ -568,12 +588,13 @@ function Draw-Lineup($g, [int]$W, [int]$H) {
     $g.DrawString('아직 계정 관측 데이터가 없습니다.', ([System.Drawing.Font]::new('Malgun Gothic', ([float]9))), $gray, (New-Object System.Drawing.RectangleF 0, ($H / 2), $W, 20), $center)
     return
   }
+  $script:pendingBubbles = New-Object System.Collections.ArrayList
   # 제외 티어 앞에 점선 구분
   $x = $LU.Pad
   $divDrawn = $false
   for ($i = 0; $i -lt $accts.Count; $i++) {
     $a = $accts[$i]
-    if (-not $divDrawn -and [string]$a.tier -eq 'skip' -and $i -gt 0) {
+    if (-not $divDrawn -and ([string]$a.tier -eq 'skip' -or [string]$a.tier -eq 'gone') -and $i -gt 0) {
       $dp = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(200, 200, 212)), 1.5
       $dp.DashStyle = 'Dash'
       $g.DrawLine($dp, [float]$x, [float]($LU.Top), [float]$x, [float]($H - $LU.Foot - 8))
@@ -582,6 +603,15 @@ function Draw-Lineup($g, [int]$W, [int]$H) {
     }
     Draw-AcctCard $g $a $x $now $reco
     $x += $LU.CardW
+  }
+  $fBub = [System.Drawing.Font]::new('Malgun Gothic', ([float]6.5))
+  foreach ($bb in $script:pendingBubbles) {
+    $sz = $g.MeasureString($bb.txt, $fBub)
+    $ux = [Math]::Min([float]$bb.ux, [float]($W - $sz.Width - 16))
+    $bub = New-RoundRect $ux $bb.uy ($sz.Width + 10) ($sz.Height + 6) 6
+    $g.FillPath([System.Drawing.Brushes]::White, $bub)
+    $g.DrawPath((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 156, 63)), 1.5), $bub)
+    $g.DrawString($bb.txt, $fBub, (New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(192, 86, 0))), [float]($ux + 5), [float]($bb.uy + 3))
   }
   # 추천 푸터
   if ($script:lastRecommend -and $accts.Count -gt 1) {

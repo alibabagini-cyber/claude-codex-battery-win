@@ -72,6 +72,17 @@ node collector.mjs --next
 - 가볍게: 온도는 센서 1개 주소(`/Sensor?action=Get&id=…`, 약 50바이트)만 읽고, 숫자가 그대로면 아이콘을 다시 그리지 않습니다. 프로그램 목록 측정은 그래프 창이 열려 있을 때만 합니다
 - 그래프의 오래된 구간은 WSL `~/.cache/thermal/<날짜>.csv`(2분 간격 `HH:MM,온도`)가 있으면 이어 붙입니다
 
+## 구독 상태 표시 (취소·Pro·끝남)
+
+카드마다 구독 상태 알약이 붙습니다: 구독중(초록) · 취소함·종료일(주황) · Pro 플랜(보라) · 구독 끝남/미확인(회색).
+
+- 정본 장부 = `~/.claude/usage-widget/subscriptions.json`. 기록은 `ccnext --sub <계정 앞부분> <active|canceled|pro|expired|unknown> [종료일 YYYY-MM-DD]`
+  (예: `ccnext --sub wjcgpt canceled 2026-11-20`). 종료일 = claude.ai 설정 › 결제 화면의 구독 종료일.
+- 취소 예약은 OAuth API로 보이지 않습니다(`/api/oauth/organizations/{org}/subscription_details` = 404). claude.ai 웹 세션의
+  `GET /api/organizations/{org}/subscription_details`(`status`, `plan_ending_at`, `next_charge_at`)에서만 확인됩니다.
+- 플랜 변화(Max→Pro, 만료)는 collector가 `/api/oauth/profile`의 `organization_type`으로 계정당 6시간에 한 번 자동 관측해 장부보다 새로우면 덮어씁니다.
+- 순위: 취소함 계정은 그대로 줄에 서고, 종료 3일 전부터 남은 주간 한도를 "구독 끝나기 전에 쓰기"로 추천합니다. 종료일이 지나면 "구독 끝남" 줄로 빠집니다. Pro 계정은 Max 계정 뒤에 섭니다(Pro 100% ≈ Max의 1/20).
+
 ## 요구사항
 
 - Windows 10/11 + WSL2 (아무 배포판)

@@ -85,6 +85,15 @@ node collector.mjs --next
 - "구독중"은 장부의 다음 결제일(nextCharge)이 지나거나 확인 후 30일이 지나면 "구독중? 재확인 필요"로 바뀐다(취소는 결제일에 효력).
 - 순위: 미확인 계정은 같은 티어 안에서 확인된 계정 뒤에 선다. 취소함 계정은 그대로 줄에 서고, 종료 3일 전부터 남은 주간 한도를 "구독 끝나기 전에 쓰기"로 추천합니다. 종료일이 지나면 "구독 끝남" 줄로 빠집니다. Pro 계정은 Max 계정 뒤에 섭니다(Pro 100% ≈ Max의 1/20).
 
+## 자동 업데이트 · 세션 유지
+
+설치 시 작업 스케줄러에 태스크 두 개가 더 등록됩니다(둘 다 끄려면 `schtasks /Delete /TN <이름> /F`).
+
+- **ClaudeCodexBatteryUpdate** (하루 1회) — `update.sh`: GitHub origin에서 fast-forward `git pull` → 코드가 바뀌었으면 트레이 재시작. 로컬 변경·분기가 있으면 보류(덮어쓰지 않음). 로그 `~/.claude/usage-widget/update.log`. 기존 설치는 한 번 `git pull && ./install.sh` 하면 이 태스크가 등록되고, 이후부터 자동.
+- **ClaudeCodexBatteryRefresh** (2일마다) — `refresh-tokens.sh`:
+  - **keep-warm**: 메인 + 각 `~/.claude-profiles/<계정>` 액세스 토큰을 최소 요청 1회로 신선하게 유지 → collector가 **모든 계정**의 실사용량을 읽어 다음 계정 추천이 정확. (쓰지 않는 계정 토큰이 만료되면 그 계정이 추천에서 빠지는 문제를 막음.)
+  - **세션 워치독**: `claude auth status`의 `loginExpiresAt`(로그인 세션, 약 한 달 고정 — 일반 사용으론 연장 안 됨)을 점검해 만료 7일 전이면 알림. 세션 연장은 **재로그인(브라우저 OAuth)만** 가능하므로, 임박하면 재로그인하세요. 로그 `~/.claude/usage-widget/refresh.log`.
+
 ## 요구사항
 
 - Windows 10/11 + WSL2 (아무 배포판)
@@ -118,7 +127,8 @@ cd claude-codex-battery-win
 
 ## 보안 / 프라이버시
 
-- **네트워크는 `api.anthropic.com`(HTTPS) 단 한 곳** — Claude 한도 조회용. 그 외 어떤 서버로도 아무것도 보내지 않습니다. 자동 업데이트/텔레메트리 없음.
+- **한도 조회 네트워크는 `api.anthropic.com`(HTTPS) 단 한 곳** — 그 외 어떤 서버로도 아무것도 보내지 않습니다. 텔레메트리 없음.
+- 코드 자동 업데이트(선택, 아래 §자동 업데이트)는 **이 repo의 GitHub origin에서 `git pull`만** 합니다 — fast-forward만 허용(로컬 변경이 있으면 건드리지 않음), 외부로 내보내는 데이터 없음. 끄려면 `schtasks /Delete /TN ClaudeCodexBatteryUpdate /F`.
 - OAuth 토큰은 collector 프로세스 안에서만 사용되며 **출력·로그·캐시에 절대 남지 않습니다**. 토큰 갱신도 하지 않습니다(읽기 전용) — 토큰이 만료되면 Claude Code를 쓰는 순간 자동으로 신선해집니다.
 - 폴백 캐시 `~/.claude/usage-widget/usage-cache.json`(권한 600)에는 퍼센트·리셋시각만 저장됩니다. 계정별 장부 `accounts.json`(권한 600)에도 이메일 + 퍼센트·리셋시각·측정시각만 저장되며 **토큰은 저장하지 않습니다**.
 - 레지스트리 쓰기는 트레이 아이콘 고정용 `HKCU\Control Panel\NotifyIconSettings\*\IsPromoted` 한 곳뿐입니다.
@@ -138,7 +148,8 @@ cd claude-codex-battery-win
 
 1. 트레이 아이콘 우클릭 → 종료
 2. 시작프로그램에서 `Claude Codex Battery.lnk` 삭제 (`Win+R` → `shell:startup`)
-3. `%USERPROFILE%\claude-codex-battery\` 폴더와 클론한 repo 삭제
+3. 작업 스케줄러 태스크 삭제: `schtasks /Delete /TN ClaudeCodexBatteryKick /F`, `... ClaudeCodexBatteryUpdate /F`, `... ClaudeCodexBatteryRefresh /F`
+4. `%USERPROFILE%\claude-codex-battery\` 폴더와 클론한 repo 삭제
 
 ## 라이선스
 

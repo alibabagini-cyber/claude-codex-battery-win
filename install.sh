@@ -52,6 +52,12 @@ Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object {
 \$tr = 'wscript.exe \"${APP_DIR_WIN}\launch.vbs\"'
 schtasks /Create /F /TN ClaudeCodexBatteryKick /SC ONCE /ST 00:00 /TR \$tr | Out-Null
 schtasks /Run /TN ClaudeCodexBatteryKick | Out-Null
+# 코드 자동 업데이트(하루 1회 git pull → 바뀌면 트레이 재시작)
+\$updTr = 'wsl.exe -d ${DISTRO} -e bash -lc \"${REPO_DIR}/update.sh\"'
+schtasks /Create /F /TN ClaudeCodexBatteryUpdate /SC DAILY /ST 09:00 /TR \$updTr | Out-Null
+# 토큰 keep-warm + 세션 만료 워치독(2일마다)
+\$refTr = 'wsl.exe -d ${DISTRO} -e bash -lc \"${REPO_DIR}/refresh-tokens.sh\"'
+schtasks /Create /F /TN ClaudeCodexBatteryRefresh /SC DAILY /MO 2 /ST 09:30 /TR \$refTr | Out-Null
 Write-Output 'OK'
 " | tr -d '\r'
 

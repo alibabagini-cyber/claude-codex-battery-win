@@ -650,19 +650,30 @@ function Show-Lineup {
         if ($script:lineupForm -and $script:lineupForm.Visible) { $script:lineupForm.Invalidate() }
       } catch {}
     })
-    $f.add_MouseClick({ param($s, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { $s.Hide() } })
-    $f.add_MouseDoubleClick({ param($s, $e)
+    # 왼클릭: 캐릭터(카드) 위면 그 계정으로 ccswitch, 빈 영역이면 닫기.
+    # (예전엔 MouseClick이 무조건 Hide해서 더블클릭의 첫 클릭에 팝업이 닫혀 ccswitch가 안 먹었음)
+    $script:lineupClickGuard = [datetime]::MinValue
+    $doSwitch = {
+      param($s, $e)
       if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
-      if (-not $script:cardHits -or $script:cardHits.Count -eq 0) { return }
+      # 더블클릭 시 Click이 두 번 와서 ccswitch 두 번 뜨는 것 방지(0.8초 가드)
+      $now = [datetime]::Now
+      if (($now - $script:lineupClickGuard).TotalMilliseconds -lt 800) { return }
+      $script:lineupClickGuard = $now
       $mx = [int]$e.X; $my = [int]$e.Y
-      foreach ($h in $script:cardHits) {
-        if ($mx -ge $h.x -and $mx -lt ($h.x + $h.w) -and $my -ge $h.y -and $my -lt ($h.y + $h.h)) {
-          Invoke-Ccswitch $h.email
-          $s.Hide()
-          return
+      if ($script:cardHits) {
+        foreach ($h in $script:cardHits) {
+          if ($mx -ge $h.x -and $mx -lt ($h.x + $h.w) -and $my -ge $h.y -and $my -lt ($h.y + $h.h)) {
+            Invoke-Ccswitch $h.email
+            $s.Hide()
+            return
+          }
         }
       }
-    })
+      $s.Hide()  # 빈 영역 = 닫기
+    }
+    $f.add_MouseClick($doSwitch)
+    $f.add_MouseDoubleClick($doSwitch)
     $f.add_KeyDown({ param($s, $e) if ($e.KeyCode -eq 'Escape') { $s.Hide() } })
     $script:lineupForm = $f
   }

@@ -562,7 +562,7 @@ function Invoke-Ccswitch([string]$email) {
     if ($email -notmatch '^[A-Za-z0-9._@+-]+$') { return }
     $cmd = "ccswitch $email"
     $title = "ccswitch $email"
-    Start-Process $wt -ArgumentList '-w','new','--size','80,24','--title',$title,'wsl.exe','-d','Ubuntu','--','bash','-lic',$cmd -WindowStyle Normal
+    Start-Process $wt -ArgumentList '-w','new','--size','80,24','--title',"`"$title`"",'wsl.exe','-d','Ubuntu','--','bash','-lic',"`"$cmd`"" -WindowStyle Normal
   } catch {}
 }
 
